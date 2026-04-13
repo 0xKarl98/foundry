@@ -755,6 +755,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         let invariant_contract =
             InvariantContract::new(self.address, func, call_after_invariant, &self.cr.contract.abi);
         let show_solidity = invariant_config.show_solidity;
+        let target_name = self.cr.name.rsplit(':').next().unwrap_or(self.cr.name);
 
         // Compute current invariant settings for failure validation.
         let current_settings = match evm.compute_settings(self.address) {
@@ -868,6 +869,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             self.build_fuzz_state(true),
             progress.as_ref(),
             &self.tcfg.early_exit,
+            target_name,
         ) {
             Ok(x) => x,
             Err(e) => {

@@ -25,6 +25,26 @@ impl InvariantFailures {
     pub fn into_inner(self) -> (usize, Option<InvariantFuzzError>) {
         (self.reverts, self.error)
     }
+
+    /// Returns whether a broken invariant has been recorded.
+    pub fn has_broken_invariant(&self) -> bool {
+        matches!(self.error, Some(InvariantFuzzError::BrokenInvariant(_)))
+    }
+
+    /// Returns the number of invariant failures seen in the current campaign.
+    ///
+    /// The current executor stops on the first broken invariant, so this is `0` or `1`.
+    pub fn failures(&self) -> usize {
+        usize::from(self.has_broken_invariant())
+    }
+
+    /// Returns the number of unique invariant failures seen in the current campaign.
+    ///
+    /// Since invariant execution currently stops on the first broken invariant, uniqueness is
+    /// identical to `failures()`.
+    pub fn unique_failures(&self) -> usize {
+        self.failures()
+    }
 }
 
 #[derive(Clone, Debug)]

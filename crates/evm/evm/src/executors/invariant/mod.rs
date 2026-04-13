@@ -263,6 +263,73 @@ impl<FEN: FoundryEvmNetwork> InvariantTest<FEN> {
     }
 }
 
+fn metrics_events_enabled(progress: Option<&ProgressBar>, edge_coverage_enabled: bool) -> bool {
+    progress.is_none() && edge_coverage_enabled
+}
+
+fn unix_timestamp_secs() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+fn invariant_failure_event(invariant: &str, target: &str, timestamp: u64) -> serde_json::Value {
+    json!({
+        "timestamp": timestamp,
+        "event": "failure",
+        "invariant": invariant,
+        "target": target,
+    })
+}
+
+fn invariant_pulse_event<T: Serialize>(
+    invariant: &str,
+    metrics: &T,
+    optimization_best_value: Option<I256>,
+    failures: &InvariantFailures,
+    timestamp: u64,
+) -> Result<serde_json::Value> {
+    let mut metrics = serde_json::to_value(metrics)?;
+    if let Some(obj) = metrics.as_object_mut() {
+        obj.insert("failures".into(), failures.failures().into());
+        obj.insert("unique_failures".into(), failures.unique_failures().into());
+    }
+
+    let mut pulse = json!({
+        "timestamp": timestamp,
+        "event": "pulse",
+        "invariant": invariant,
+        "metrics": metrics,
+    });
+
+    if let Some(best) = optimization_best_value {
+        pulse["optimization_best"] = json!(best.to_string());
+    }
+
+    Ok(pulse)
+}
+
+fn emit_invariant_failure_event(invariant: &str, target: &str) -> Result<()> {
+    let event = invariant_failure_event(invariant, target, unix_timestamp_secs()?);
+    let _ = sh_println!("{}", serde_json::to_string(&event)?);
+    Ok(())
+}
+
+fn emit_invariant_pulse_event<T: Serialize>(
+    invariant: &str,
+    metrics: &T,
+    optimization_best_value: Option<I256>,
+    failures: &InvariantFailures,
+) -> Result<()> {
+    let pulse = invariant_pulse_event(
+        invariant,
+        metrics,
+        optimization_best_value,
+        failures,
+        unix_timestamp_secs()?,
+    )?;
+    let _ = sh_println!("{}", serde_json::to_string(&pulse)?);
+    Ok(())
+}
+
 /// Contains data for an invariant test run.
 struct InvariantTestRun<FEN: FoundryEvmNetwork> {
     // Invariant run call sequence.
@@ -357,6 +424,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         fuzz_state: EvmFuzzState,
         progress: Option<&ProgressBar>,
         early_exit: &EarlyExit,
+        target_name: &str,
     ) -> Result<InvariantFuzzTestResult> {
         // Throw an error to abort test run if the invariant function accepts input params
         if !invariant_contract.invariant_function.inputs.is_empty() {
@@ -370,6 +438,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let mut runs = 0;
         let timer = FuzzTestTimer::new(self.config.timeout);
         let mut last_metrics_report = Instant::now();
+        let mut failure_event_emitted = false;
         let continue_campaign = |runs: u32| {
             if early_exit.should_stop() {
                 return false;
@@ -380,6 +449,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
 
         // Invariant runs with edge coverage if corpus dir is set or showing edge coverage.
         let edge_coverage_enabled = self.config.corpus.collect_edge_coverage();
+        let emit_metrics_events = metrics_events_enabled(progress, edge_coverage_enabled);
 
         'stop: while continue_campaign(runs) {
             let initial_seq = corpus_manager.new_inputs(
@@ -546,6 +616,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     if !result.can_continue || current_run.depth == self.config.depth - 1 {
                         invariant_test.set_last_run_inputs(&current_run.inputs);
                     }
+                    if emit_metrics_events
+                        && !failure_event_emitted
+                        && invariant_test.test_data.failures.has_broken_invariant()
+                    {
+                        emit_invariant_failure_event(
+                            invariant_contract.invariant_function.name.as_str(),
+                            target_name,
+                        )?;
+                        failure_event_emitted = true;
+                    }
                     // If test cannot continue then stop current run and exit test suite.
                     if !result.can_continue {
                         break 'stop;
@@ -586,6 +666,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 )
                 .map_err(|_| eyre!("Failed to call afterInvariant"))?;
             }
+            if emit_metrics_events
+                && !failure_event_emitted
+                && invariant_test.test_data.failures.has_broken_invariant()
+            {
+                emit_invariant_failure_event(
+                    invariant_contract.invariant_function.name.as_str(),
+                    target_name,
+                )?;
+                failure_event_emitted = true;
+            }
 
             // End current invariant test run.
             invariant_test.end_run(current_run, self.config.gas_report_samples as usize);
@@ -607,21 +697,15 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     }
                     progress.set_message(msg);
                 }
-            } else if edge_coverage_enabled
+            } else if emit_metrics_events
                 && last_metrics_report.elapsed() > DURATION_BETWEEN_METRICS_REPORT
             {
-                // Display corpus metrics inline as JSON.
-                let mut metrics = json!({
-                    "timestamp": SystemTime::now()
-                        .duration_since(UNIX_EPOCH)?
-                        .as_secs(),
-                    "invariant": invariant_contract.invariant_function.name,
-                    "metrics": &corpus_manager.metrics,
-                });
-                if let Some(best) = invariant_test.test_data.optimization_best_value {
-                    metrics["optimization_best"] = json!(best.to_string());
-                }
-                let _ = sh_println!("{}", serde_json::to_string(&metrics)?);
+                emit_invariant_pulse_event(
+                    invariant_contract.invariant_function.name.as_str(),
+                    &corpus_manager.metrics,
+                    invariant_test.test_data.optimization_best_value,
+                    &invariant_test.test_data.failures,
+                )?;
                 last_metrics_report = Instant::now();
             }
 
@@ -1190,4 +1274,73 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     executor
         .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), U256::ZERO)
         .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executors::invariant::error::FailedInvariantCaseData;
+    use foundry_evm_fuzz::Reason;
+    use proptest::test_runner::{Reason as TestReason, TestError};
+
+    fn dummy_case_data() -> FailedInvariantCaseData {
+        FailedInvariantCaseData {
+            test_error: TestError::Abort(TestReason::from("broken invariant")),
+            return_reason: Reason::from("broken invariant"),
+            revert_reason: "broken invariant".to_string(),
+            addr: Address::ZERO,
+            calldata: Bytes::new(),
+            inner_sequence: vec![],
+            shrink_run_limit: 0,
+            fail_on_revert: false,
+        }
+    }
+
+    #[test]
+    fn invariant_failure_event_has_expected_shape() {
+        let event = invariant_failure_event("invariant_counter", "CounterTest", 123);
+
+        assert_eq!(
+            event,
+            json!({
+                "timestamp": 123_u64,
+                "event": "failure",
+                "invariant": "invariant_counter",
+                "target": "CounterTest",
+            })
+        );
+    }
+
+    #[test]
+    fn invariant_pulse_event_includes_failure_counts_and_optimization_best() {
+        let failures = InvariantFailures {
+            error: Some(InvariantFuzzError::BrokenInvariant(dummy_case_data())),
+            ..Default::default()
+        };
+
+        let event = invariant_pulse_event(
+            "invariant_counter",
+            &json!({ "cumulative_edges_seen": 273, "corpus_count": 78 }),
+            Some(I256::try_from(42).unwrap()),
+            &failures,
+            321,
+        )
+        .unwrap();
+
+        assert_eq!(
+            event,
+            json!({
+                "timestamp": 321_u64,
+                "event": "pulse",
+                "invariant": "invariant_counter",
+                "metrics": {
+                    "cumulative_edges_seen": 273,
+                    "corpus_count": 78,
+                    "failures": 1,
+                    "unique_failures": 1,
+                },
+                "optimization_best": "42",
+            })
+        );
+    }
 }

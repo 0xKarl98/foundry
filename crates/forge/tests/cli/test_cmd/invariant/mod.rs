@@ -244,6 +244,53 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
 "#]]);
 });
 
+forgetest_init!(should_emit_invariant_failure_event, |prj, cmd| {
+    prj.update_config(|config| {
+        config.invariant.runs = 1;
+        config.invariant.depth = 10;
+        config.invariant.corpus.show_edge_coverage = true;
+    });
+
+    prj.add_test(
+        "InvariantFailureEvent.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract BreakingHandler {
+    uint256 public broken;
+
+    function breakInvariant() public {
+        broken = 1;
+    }
+}
+
+contract InvariantFailureEventTest is Test {
+    BreakingHandler handler;
+
+    function setUp() public {
+        handler = new BreakingHandler();
+        targetContract(address(handler));
+    }
+
+    function invariant_broken_counter() public view {
+        require(handler.broken() == 0, "broken invariant");
+    }
+}
+     "#,
+    );
+
+    cmd.args(["test", "--mt", "invariant_broken_counter", "-j1"]).assert_failure().stdout_eq(
+        str![[r#"
+...
+{"timestamp":[..],"event":"failure","invariant":"invariant_broken_counter","target":"InvariantFailureEventTest"}
+...
+Ran 1 test for test/InvariantFailureEvent.t.sol:InvariantFailureEventTest
+[FAIL: broken invariant]
+...
+"#]],
+    );
+});
+
 // Tests that invariant exists with success after configured timeout.
 forgetest_init!(should_apply_configured_timeout, |prj, cmd| {
     // Add initial test that breaks invariant.
