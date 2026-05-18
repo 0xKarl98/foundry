@@ -36,6 +36,21 @@ contract MissingEventsAccessControl is BaseOwner {
         _;
     }
 
+    modifier checkTreasury() {
+        require(treasury != address(0), "treasury unset");
+        _;
+    }
+
+    modifier only(address who) {
+        require(msg.sender == who, "not authorized");
+        _;
+    }
+
+    modifier emitsOwnershipChange(address newOwner) {
+        emit OwnershipTransferred(owner, newOwner);
+        _;
+    }
+
     modifier nonAccessControl() {
         _;
     }
@@ -68,6 +83,10 @@ contract MissingEventsAccessControl is BaseOwner {
         admin = newAdmin; //~WARN: access control state change should emit an event
     }
 
+    function transferOwnershipGeneric(address newOwner) external only(owner) {
+        owner = newOwner; //~WARN: access control state change should emit an event
+    }
+
     // SHOULD NOT WARN:
 
     function transferOwnershipWithEvent(address newOwner) external onlyOwner {
@@ -77,6 +96,18 @@ contract MissingEventsAccessControl is BaseOwner {
 
     function setTreasury(address newTreasury) external onlyOwner {
         treasury = newTreasury;
+    }
+
+    function setTreasuryWithSanityModifier(address newTreasury) external onlyOwner checkTreasury {
+        treasury = newTreasury;
+    }
+
+    function transferOwnershipWithModifierEvent(address newOwner)
+        external
+        onlyOwner
+        emitsOwnershipChange(newOwner)
+    {
+        owner = newOwner;
     }
 
     function setPendingOwner(address newPendingOwner) external writesPendingOwner(newPendingOwner) {

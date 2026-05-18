@@ -6,7 +6,9 @@ use crate::{
 use solar::{
     ast,
     interface::{data_structures::Never, sym},
-    sema::hir::{self, ElementaryType, ExprKind, ItemId, Res, StmtKind, TypeKind, Visit},
+    sema::hir::{
+        self, BinOpKind, ElementaryType, ExprKind, ItemId, Res, StmtKind, TypeKind, Visit,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -32,7 +34,7 @@ impl<'hir> LateLintPass<'hir> for MissingEventsAccessControl {
         }
 
         let Some(body) = func.body else { return };
-        if contains_event(hir, body) {
+        if contains_event(hir, body) || modifiers_contain_event(hir, func) {
             return;
         }
 
@@ -182,6 +184,68 @@ fn contains_msg_sender(expr: &hir::Expr<'_>) -> bool {
     }
 }
 
+fn collect_state_vars(expr: &hir::Expr<'_>, out: &mut HashSet<hir::VariableId>) {
+    match &expr.kind {
+        ExprKind::Ident(reses) => {
+            for res in *reses {
+                if let Res::Item(ItemId::Variable(var_id)) = res {
+                    out.insert(*var_id);
+                }
+            }
+        }
+        ExprKind::Assign(lhs, _, rhs) | ExprKind::Binary(lhs, _, rhs) => {
+            collect_state_vars(lhs, out);
+            collect_state_vars(rhs, out);
+        }
+        ExprKind::Call(callee, args, opts) => {
+            collect_state_vars(callee, out);
+            for arg in args.exprs() {
+                collect_state_vars(arg, out);
+            }
+            if let Some(opts) = opts {
+                for opt in *opts {
+                    collect_state_vars(&opt.value, out);
+                }
+            }
+        }
+        ExprKind::Delete(inner)
+        | ExprKind::Member(inner, _)
+        | ExprKind::Payable(inner)
+        | ExprKind::Unary(_, inner) => collect_state_vars(inner, out),
+        ExprKind::Index(base, index) => {
+            collect_state_vars(base, out);
+            if let Some(index) = index {
+                collect_state_vars(index, out);
+            }
+        }
+        ExprKind::Slice(base, start, end) => {
+            collect_state_vars(base, out);
+            if let Some(start) = start {
+                collect_state_vars(start, out);
+            }
+            if let Some(end) = end {
+                collect_state_vars(end, out);
+            }
+        }
+        ExprKind::Ternary(cond, then, else_) => {
+            collect_state_vars(cond, out);
+            collect_state_vars(then, out);
+            collect_state_vars(else_, out);
+        }
+        ExprKind::Tuple(exprs) => {
+            for expr in exprs.iter().copied().flatten() {
+                collect_state_vars(expr, out);
+            }
+        }
+        ExprKind::Array(exprs) => {
+            for expr in *exprs {
+                collect_state_vars(expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_msg_sender(expr: &hir::Expr<'_>) -> bool {
     matches!(
         &expr.kind,
@@ -195,6 +259,14 @@ fn is_msg_sender(expr: &hir::Expr<'_>) -> bool {
                     })
             )
     )
+}
+
+fn modifiers_contain_event(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
+    func.modifiers.iter().any(|invocation| {
+        let Some(modifier_id) = invocation.id.as_function() else { return false };
+        let modifier = hir.function(modifier_id);
+        modifier.body.is_some_and(|body| contains_event(hir, body))
+    })
 }
 
 fn contains_event(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
@@ -242,31 +314,213 @@ fn contract_modifier_state_reads(
             continue;
         }
         let Some(body) = modifier.body else { continue };
+        if !is_access_control_modifier(hir, modifier, body) {
+            continue;
+        }
 
-        let mut collector = StateReadCollector { hir, vars: HashSet::new() };
+        let mut collector = AccessControlReadCollector::new(hir);
         for stmt in body.stmts {
             let _ = collector.visit_stmt(stmt);
         }
-        reads
-            .extend(collector.vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)));
+        reads.extend(
+            collector.state_vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)),
+        );
     }
+
+    for invocation in func.modifiers {
+        collect_invocation_access_control_vars(hir, invocation, &mut reads);
+    }
+
     reads
 }
 
-struct StateReadCollector<'hir> {
-    hir: &'hir hir::Hir<'hir>,
-    vars: HashSet<hir::VariableId>,
+fn is_access_control_modifier(
+    hir: &hir::Hir<'_>,
+    modifier: &hir::Function<'_>,
+    body: hir::Block<'_>,
+) -> bool {
+    modifier.name.is_some_and(|name| name.as_str() == "onlyOwner")
+        || body_has_msg_sender_check(hir, body)
 }
 
-impl<'hir> Visit<'hir> for StateReadCollector<'hir> {
+fn collect_invocation_access_control_vars(
+    hir: &hir::Hir<'_>,
+    invocation: &hir::Modifier<'_>,
+    out: &mut HashSet<hir::VariableId>,
+) {
+    let Some(modifier_id) = invocation.id.as_function() else { return };
+    let modifier = hir.function(modifier_id);
+    let Some(body) = modifier.body else { return };
+    if !is_access_control_modifier(hir, modifier, body) {
+        return;
+    }
+
+    let mut collector = AccessControlReadCollector::new(hir);
+    for stmt in body.stmts {
+        let _ = collector.visit_stmt(stmt);
+    }
+
+    for var_id in collector.state_vars {
+        if is_address_state_var(hir, var_id) {
+            out.insert(var_id);
+        }
+    }
+
+    for param in collector.params {
+        let Some(index) = modifier.parameters.iter().position(|&id| id == param) else {
+            continue;
+        };
+        let Some(arg) = invocation.args.exprs().nth(index) else { continue };
+        let mut arg_vars = HashSet::new();
+        collect_state_vars(arg, &mut arg_vars);
+        out.extend(arg_vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)));
+    }
+}
+
+struct AccessControlReadCollector<'hir> {
+    hir: &'hir hir::Hir<'hir>,
+    state_vars: HashSet<hir::VariableId>,
+    params: HashSet<hir::VariableId>,
+}
+
+impl<'hir> AccessControlReadCollector<'hir> {
+    fn new(hir: &'hir hir::Hir<'hir>) -> Self {
+        Self { hir, state_vars: HashSet::new(), params: HashSet::new() }
+    }
+
+    fn collect_access_vars(&mut self, expr: &'hir hir::Expr<'hir>) {
+        match &expr.kind {
+            ExprKind::Binary(lhs, op, rhs) if matches!(op.kind, BinOpKind::Eq | BinOpKind::Ne) => {
+                if contains_msg_sender(lhs) {
+                    self.collect_non_sender_vars(rhs);
+                } else if contains_msg_sender(rhs) {
+                    self.collect_non_sender_vars(lhs);
+                } else {
+                    self.collect_access_vars(lhs);
+                    self.collect_access_vars(rhs);
+                }
+            }
+            ExprKind::Binary(lhs, op, rhs) if matches!(op.kind, BinOpKind::And | BinOpKind::Or) => {
+                self.collect_access_vars(lhs);
+                self.collect_access_vars(rhs);
+            }
+            ExprKind::Call(callee, args, _) => {
+                if let ExprKind::Index(base, Some(index)) = &callee.kind {
+                    if contains_msg_sender(index) {
+                        self.collect_non_sender_vars(base);
+                    }
+                }
+                for arg in args.exprs() {
+                    self.collect_access_vars(arg);
+                }
+            }
+            ExprKind::Unary(_, inner) | ExprKind::Payable(inner) | ExprKind::Member(inner, _) => {
+                self.collect_access_vars(inner)
+            }
+            ExprKind::Tuple(exprs) => {
+                for expr in exprs.iter().copied().flatten() {
+                    self.collect_access_vars(expr);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_non_sender_vars(&mut self, expr: &'hir hir::Expr<'hir>) {
+        match &expr.kind {
+            ExprKind::Ident(reses) => {
+                for res in *reses {
+                    if let Res::Item(ItemId::Variable(var_id)) = res {
+                        let var = self.hir.variable(*var_id);
+                        if var.kind.is_state() {
+                            self.state_vars.insert(*var_id);
+                        } else if matches!(var.kind, hir::VarKind::FunctionParam) {
+                            self.params.insert(*var_id);
+                        }
+                    }
+                }
+            }
+            ExprKind::Assign(lhs, _, rhs) | ExprKind::Binary(lhs, _, rhs) => {
+                self.collect_non_sender_vars(lhs);
+                self.collect_non_sender_vars(rhs);
+            }
+            ExprKind::Call(callee, args, opts) => {
+                self.collect_non_sender_vars(callee);
+                for arg in args.exprs() {
+                    self.collect_non_sender_vars(arg);
+                }
+                if let Some(opts) = opts {
+                    for opt in *opts {
+                        self.collect_non_sender_vars(&opt.value);
+                    }
+                }
+            }
+            ExprKind::Delete(inner)
+            | ExprKind::Member(inner, _)
+            | ExprKind::Payable(inner)
+            | ExprKind::Unary(_, inner) => self.collect_non_sender_vars(inner),
+            ExprKind::Index(base, index) => {
+                self.collect_non_sender_vars(base);
+                if let Some(index) = index {
+                    self.collect_non_sender_vars(index);
+                }
+            }
+            ExprKind::Slice(base, start, end) => {
+                self.collect_non_sender_vars(base);
+                if let Some(start) = start {
+                    self.collect_non_sender_vars(start);
+                }
+                if let Some(end) = end {
+                    self.collect_non_sender_vars(end);
+                }
+            }
+            ExprKind::Ternary(cond, then, else_) => {
+                self.collect_non_sender_vars(cond);
+                self.collect_non_sender_vars(then);
+                self.collect_non_sender_vars(else_);
+            }
+            ExprKind::Tuple(exprs) => {
+                for expr in exprs.iter().copied().flatten() {
+                    self.collect_non_sender_vars(expr);
+                }
+            }
+            ExprKind::Array(exprs) => {
+                for expr in *exprs {
+                    self.collect_non_sender_vars(expr);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     type BreakValue = Never;
 
     fn hir(&self) -> &'hir hir::Hir<'hir> {
         self.hir
     }
 
+    fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
+        if let StmtKind::If(cond, then, else_) = stmt.kind {
+            self.collect_access_vars(cond);
+            let _ = self.visit_stmt(then);
+            if let Some(else_) = else_ {
+                let _ = self.visit_stmt(else_);
+            }
+            return ControlFlow::Continue(());
+        }
+        self.walk_stmt(stmt)
+    }
+
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
         match &expr.kind {
+            ExprKind::Call(callee, args, _) if is_require_or_assert(callee) => {
+                if let Some(cond) = args.exprs().next() {
+                    self.collect_access_vars(cond);
+                }
+                return ControlFlow::Continue(());
+            }
             ExprKind::Assign(lhs, op, rhs) => {
                 if op.is_some() {
                     let _ = self.visit_expr(lhs);
@@ -275,15 +529,6 @@ impl<'hir> Visit<'hir> for StateReadCollector<'hir> {
                 return ControlFlow::Continue(());
             }
             ExprKind::Delete(_) => return ControlFlow::Continue(()),
-            ExprKind::Ident(reses) => {
-                for res in *reses {
-                    if let Res::Item(ItemId::Variable(var_id)) = res
-                        && self.hir.variable(*var_id).kind.is_state()
-                    {
-                        self.vars.insert(*var_id);
-                    }
-                }
-            }
             _ => {}
         }
         self.walk_expr(expr)
