@@ -38,7 +38,7 @@ impl<'hir> LateLintPass<'hir> for MissingEventsAccessControl {
             return;
         }
 
-        let access_control_vars = contract_modifier_state_reads(hir, func);
+        let access_control_vars = access_control_state_vars(hir, func);
         if access_control_vars.is_empty() {
             return;
         }
@@ -80,7 +80,7 @@ fn is_address_local(hir: &hir::Hir<'_>, var_id: hir::VariableId) -> bool {
 
 fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
     if let Some(body) = func.body
-        && body_has_msg_sender_gate(hir, body)
+        && body_has_msg_sender_gate(hir, body, false)
     {
         return true;
     }
@@ -88,12 +88,12 @@ fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
     func.modifiers.iter().any(|invocation| {
         let Some(modifier_id) = invocation.id.as_function() else { return false };
         let modifier = hir.function(modifier_id);
-        modifier.body.is_some_and(|body| body_has_msg_sender_gate(hir, body))
+        modifier.body.is_some_and(|body| body_has_msg_sender_gate(hir, body, true))
     })
 }
 
-fn body_has_msg_sender_gate(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
-    let mut visitor = MsgSenderGateVisitor { hir, found: false };
+fn body_has_msg_sender_gate(hir: &hir::Hir<'_>, body: hir::Block<'_>, allow_params: bool) -> bool {
+    let mut visitor = MsgSenderGateVisitor { hir, allow_params, found: false };
     for stmt in body.stmts {
         let _ = visitor.visit_stmt(stmt);
         if visitor.found {
@@ -104,10 +104,16 @@ fn body_has_msg_sender_gate(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
 }
 
 fn msg_sender_if_gates_execution(
+    hir: &hir::Hir<'_>,
     cond: &hir::Expr<'_>,
     then: &hir::Stmt<'_>,
     else_: Option<&hir::Stmt<'_>>,
+    allow_params: bool,
 ) -> bool {
+    if !condition_has_access_control_value(hir, cond, allow_params) {
+        return false;
+    }
+
     match sender_condition_allows(cond) {
         Some(true) => else_.is_some_and(stmt_exits),
         Some(false) => stmt_exits(then),
@@ -147,6 +153,7 @@ fn block_exits(block: hir::Block<'_>) -> bool {
 
 struct MsgSenderGateVisitor<'hir> {
     hir: &'hir hir::Hir<'hir>,
+    allow_params: bool,
     found: bool,
 }
 
@@ -159,7 +166,7 @@ impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
         if let StmtKind::If(cond, then, else_) = stmt.kind
-            && msg_sender_if_gates_execution(cond, then, else_)
+            && msg_sender_if_gates_execution(self.hir, cond, then, else_, self.allow_params)
         {
             self.found = true;
             return ControlFlow::Continue(());
@@ -170,7 +177,9 @@ impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
         if let ExprKind::Call(callee, args, _) = &expr.kind
             && is_require_or_assert(callee)
-            && args.exprs().next().is_some_and(contains_msg_sender)
+            && args.exprs().next().is_some_and(|cond| {
+                condition_has_access_control_value(self.hir, cond, self.allow_params)
+            })
         {
             self.found = true;
             return ControlFlow::Continue(());
@@ -345,11 +354,16 @@ impl<'hir> Visit<'hir> for EventVisitor<'hir> {
     }
 }
 
-fn contract_modifier_state_reads(
+fn access_control_state_vars(
     hir: &hir::Hir<'_>,
     func: &hir::Function<'_>,
 ) -> HashSet<hir::VariableId> {
     let mut reads = HashSet::new();
+
+    if let Some(body) = func.body {
+        collect_body_access_control_state_vars(hir, body, &mut reads);
+    }
+
     let Some(contract_id) = func.contract else { return reads };
 
     for item in hir.contract_items(contract_id) {
@@ -371,15 +385,18 @@ fn contract_modifier_state_reads(
         );
     }
 
-    for invocation in func.modifiers {
-        collect_invocation_access_control_vars(hir, invocation, &mut reads);
+    for item in hir.contract_items(contract_id) {
+        let hir::Item::Function(func) = item else { continue };
+        for invocation in func.modifiers {
+            collect_invocation_access_control_vars(hir, invocation, &mut reads);
+        }
     }
 
     reads
 }
 
 fn is_access_control_modifier(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
-    body_has_msg_sender_gate(hir, body)
+    body_has_msg_sender_gate(hir, body, true)
 }
 
 fn collect_invocation_access_control_vars(
@@ -532,6 +549,31 @@ impl<'hir> AccessControlReadCollector<'hir> {
     }
 }
 
+fn condition_has_access_control_value(
+    hir: &hir::Hir<'_>,
+    expr: &hir::Expr<'_>,
+    allow_params: bool,
+) -> bool {
+    let mut collector = AccessControlReadCollector::new(hir);
+    collector.collect_access_vars(expr);
+    (allow_params && collector.params.iter().any(|&var_id| is_address_local(hir, var_id)))
+        || collector.state_vars.iter().any(|&var_id| is_address_state_var(hir, var_id))
+}
+
+fn collect_body_access_control_state_vars(
+    hir: &hir::Hir<'_>,
+    body: hir::Block<'_>,
+    out: &mut HashSet<hir::VariableId>,
+) {
+    let mut collector = AccessControlReadCollector::new(hir);
+    for stmt in body.stmts {
+        let _ = collector.visit_stmt(stmt);
+    }
+    out.extend(
+        collector.state_vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)),
+    );
+}
+
 impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     type BreakValue = Never;
 
@@ -541,7 +583,7 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
         if let StmtKind::If(cond, then, else_) = stmt.kind {
-            if msg_sender_if_gates_execution(cond, then, else_) {
+            if msg_sender_if_gates_execution(self.hir, cond, then, else_, true) {
                 self.collect_access_vars(cond);
             }
             let _ = self.visit_stmt(then);
@@ -556,7 +598,9 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
         match &expr.kind {
             ExprKind::Call(callee, args, _) if is_require_or_assert(callee) => {
-                if let Some(cond) = args.exprs().next() {
+                if let Some(cond) = args.exprs().next()
+                    && condition_has_access_control_value(self.hir, cond, true)
+                {
                     self.collect_access_vars(cond);
                 }
                 return ControlFlow::Continue(());
@@ -645,8 +689,7 @@ impl<'hir> Analyzer<'hir> {
                     let var = self.hir.variable(*var_id);
                     matches!(var.kind, hir::VarKind::TryCatch)
                         || (matches!(var.kind, hir::VarKind::FunctionParam)
-                            && (self.entry_params.contains(var_id)
-                                || self.modifier_param_taint.get(var_id).copied().unwrap_or(false)))
+                            && self.param_taint(*var_id))
                         || self.taint.get(var_id).copied().unwrap_or(false)
                 }
                 Res::Builtin(_) => true,
@@ -694,6 +737,13 @@ impl<'hir> Analyzer<'hir> {
                 self.findings.push(span);
             }
         }
+    }
+
+    fn param_taint(&self, var_id: hir::VariableId) -> bool {
+        self.taint.get(&var_id).copied().unwrap_or_else(|| {
+            self.entry_params.contains(&var_id)
+                || self.modifier_param_taint.get(&var_id).copied().unwrap_or(false)
+        })
     }
 }
 

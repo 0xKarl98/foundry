@@ -147,6 +147,59 @@ contract MissingEventsAccessControl is BaseOwner {
     }
 }
 
+contract InlineOnlyAccessControl {
+    address public owner;
+
+    function transferOwnership(address newOwner) external {
+        require(msg.sender == owner, "not owner");
+        owner = newOwner; //~WARN: access control state change should emit an event
+    }
+}
+
+contract ParameterizedAccessControl {
+    address public owner;
+    address public admin;
+
+    modifier only(address who) {
+        require(msg.sender == who, "not authorized");
+        _;
+    }
+
+    function adminAction() external only(admin) {}
+
+    function setAdmin(address newAdmin) external only(owner) {
+        admin = newAdmin; //~WARN: access control state change should emit an event
+    }
+}
+
+contract NonAccessSenderRequire {
+    address public owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    function unprotectedSetOwner(address newOwner) external {
+        require(msg.sender != address(0), "zero sender");
+        owner = newOwner;
+    }
+}
+
+contract ClearedParameterTaint {
+    address public owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    function setOwnerViaClearedParam(address newOwner) external onlyOwner {
+        newOwner = address(0x1234);
+        owner = newOwner;
+    }
+}
+
 contract MisleadingModifierName {
     address public owner;
     bool public flag = true;
