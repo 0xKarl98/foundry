@@ -46,3 +46,11 @@ LL │         owner = newOwner;
    │
    ╰ help: https://getfoundry.sh/forge/linting/missing-events-access-control
 
+warning[missing-events-access-control]: access control state change should emit an event
+   ╭▸ ROOT/testdata/MissingEventsAccessControl.sol:LL:CC
+   │
+LL │         owner = nextOwner;
+   │         ━━━━━
+   │
+   ╰ help: https://getfoundry.sh/forge/linting/missing-events-access-control
+

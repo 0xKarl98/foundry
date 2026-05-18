@@ -7,7 +7,7 @@ use solar::{
     ast,
     interface::{data_structures::Never, sym},
     sema::hir::{
-        self, BinOpKind, ElementaryType, ExprKind, ItemId, Res, StmtKind, TypeKind, Visit,
+        self, BinOpKind, ElementaryType, ExprKind, ItemId, Res, StmtKind, TypeKind, UnOpKind, Visit,
     },
 };
 use std::{
@@ -43,9 +43,12 @@ impl<'hir> LateLintPass<'hir> for MissingEventsAccessControl {
             return;
         }
 
-        let mut analyzer = Analyzer::new(hir, &access_control_vars);
+        let mut analyzer = Analyzer::new(hir, &access_control_vars, func.parameters);
         for stmt in body.stmts {
             let _ = analyzer.visit_stmt(stmt);
+        }
+        for modifier in func.modifiers {
+            analyzer.visit_modifier_invocation(modifier);
         }
 
         for finding in analyzer.findings {
@@ -77,7 +80,7 @@ fn is_address_local(hir: &hir::Hir<'_>, var_id: hir::VariableId) -> bool {
 
 fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
     if let Some(body) = func.body
-        && body_has_msg_sender_check(hir, body)
+        && body_has_msg_sender_gate(hir, body)
     {
         return true;
     }
@@ -85,12 +88,12 @@ fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
     func.modifiers.iter().any(|invocation| {
         let Some(modifier_id) = invocation.id.as_function() else { return false };
         let modifier = hir.function(modifier_id);
-        modifier.body.is_some_and(|body| body_has_msg_sender_check(hir, body))
+        modifier.body.is_some_and(|body| body_has_msg_sender_gate(hir, body))
     })
 }
 
-fn body_has_msg_sender_check(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
-    let mut visitor = MsgSenderCheckVisitor { hir, found: false };
+fn body_has_msg_sender_gate(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
+    let mut visitor = MsgSenderGateVisitor { hir, found: false };
     for stmt in body.stmts {
         let _ = visitor.visit_stmt(stmt);
         if visitor.found {
@@ -100,12 +103,54 @@ fn body_has_msg_sender_check(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
     false
 }
 
-struct MsgSenderCheckVisitor<'hir> {
+fn msg_sender_if_gates_execution(
+    cond: &hir::Expr<'_>,
+    then: &hir::Stmt<'_>,
+    else_: Option<&hir::Stmt<'_>>,
+) -> bool {
+    match sender_condition_allows(cond) {
+        Some(true) => else_.is_some_and(stmt_exits),
+        Some(false) => stmt_exits(then),
+        None => false,
+    }
+}
+
+fn sender_condition_allows(expr: &hir::Expr<'_>) -> Option<bool> {
+    match &expr.peel_parens().kind {
+        ExprKind::Binary(lhs, op, rhs) if contains_msg_sender(lhs) || contains_msg_sender(rhs) => {
+            match op.kind {
+                BinOpKind::Eq => Some(true),
+                BinOpKind::Ne => Some(false),
+                _ => None,
+            }
+        }
+        ExprKind::Unary(op, inner) if op.kind == UnOpKind::Not => sender_condition_allows(inner)
+            .map(|allows| !allows)
+            .or_else(|| contains_msg_sender(inner).then_some(false)),
+        ExprKind::Call(_, _, _) | ExprKind::Index(_, _) if contains_msg_sender(expr) => Some(true),
+        _ => None,
+    }
+}
+
+fn stmt_exits(stmt: &hir::Stmt<'_>) -> bool {
+    match stmt.kind {
+        StmtKind::Return(_) | StmtKind::Revert(_) => true,
+        StmtKind::Block(block) | StmtKind::UncheckedBlock(block) => block_exits(block),
+        StmtKind::If(_, then, Some(else_)) => stmt_exits(then) && stmt_exits(else_),
+        _ => false,
+    }
+}
+
+fn block_exits(block: hir::Block<'_>) -> bool {
+    block.stmts.last().is_some_and(stmt_exits)
+}
+
+struct MsgSenderGateVisitor<'hir> {
     hir: &'hir hir::Hir<'hir>,
     found: bool,
 }
 
-impl<'hir> Visit<'hir> for MsgSenderCheckVisitor<'hir> {
+impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
     type BreakValue = Never;
 
     fn hir(&self) -> &'hir hir::Hir<'hir> {
@@ -113,8 +158,8 @@ impl<'hir> Visit<'hir> for MsgSenderCheckVisitor<'hir> {
     }
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
-        if let StmtKind::If(cond, _, _) = stmt.kind
-            && contains_msg_sender(cond)
+        if let StmtKind::If(cond, then, else_) = stmt.kind
+            && msg_sender_if_gates_execution(cond, then, else_)
         {
             self.found = true;
             return ControlFlow::Continue(());
@@ -334,7 +379,7 @@ fn contract_modifier_state_reads(
 }
 
 fn is_access_control_modifier(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
-    body_has_msg_sender_check(hir, body)
+    body_has_msg_sender_gate(hir, body)
 }
 
 fn collect_invocation_access_control_vars(
@@ -361,10 +406,9 @@ fn collect_invocation_access_control_vars(
     }
 
     for param in collector.params {
-        let Some(index) = modifier.parameters.iter().position(|&id| id == param) else {
+        let Some(arg) = invocation_arg_for_param(hir, modifier, invocation, param) else {
             continue;
         };
-        let Some(arg) = invocation.args.exprs().nth(index) else { continue };
         let mut arg_vars = HashSet::new();
         collect_state_vars(arg, &mut arg_vars);
         out.extend(arg_vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)));
@@ -399,10 +443,10 @@ impl<'hir> AccessControlReadCollector<'hir> {
                 self.collect_access_vars(rhs);
             }
             ExprKind::Call(callee, args, _) => {
-                if let ExprKind::Index(base, Some(index)) = &callee.kind {
-                    if contains_msg_sender(index) {
-                        self.collect_non_sender_vars(base);
-                    }
+                if let ExprKind::Index(base, Some(index)) = &callee.kind
+                    && contains_msg_sender(index)
+                {
+                    self.collect_non_sender_vars(base);
                 }
                 for arg in args.exprs() {
                     self.collect_access_vars(arg);
@@ -497,7 +541,9 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
         if let StmtKind::If(cond, then, else_) = stmt.kind {
-            self.collect_access_vars(cond);
+            if msg_sender_if_gates_execution(cond, then, else_) {
+                self.collect_access_vars(cond);
+            }
             let _ = self.visit_stmt(then);
             if let Some(else_) = else_ {
                 let _ = self.visit_stmt(else_);
@@ -532,19 +578,63 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
 struct Analyzer<'hir> {
     hir: &'hir hir::Hir<'hir>,
     access_control_vars: &'hir HashSet<hir::VariableId>,
+    entry_params: &'hir [hir::VariableId],
     taint: HashMap<hir::VariableId, bool>,
+    modifier_param_taint: HashMap<hir::VariableId, bool>,
     findings: Vec<solar::interface::Span>,
     emitted_vars: HashSet<hir::VariableId>,
 }
 
 impl<'hir> Analyzer<'hir> {
-    fn new(hir: &'hir hir::Hir<'hir>, access_control_vars: &'hir HashSet<hir::VariableId>) -> Self {
+    fn new(
+        hir: &'hir hir::Hir<'hir>,
+        access_control_vars: &'hir HashSet<hir::VariableId>,
+        entry_params: &'hir [hir::VariableId],
+    ) -> Self {
         Self {
             hir,
             access_control_vars,
+            entry_params,
             taint: HashMap::new(),
+            modifier_param_taint: HashMap::new(),
             findings: Vec::new(),
             emitted_vars: HashSet::new(),
+        }
+    }
+
+    fn visit_modifier_invocation(&mut self, invocation: &'hir hir::Modifier<'hir>) {
+        let Some(modifier_id) = invocation.id.as_function() else { return };
+        let modifier = self.hir.function(modifier_id);
+        let Some(body) = modifier.body else { return };
+
+        let restore = self.bind_modifier_params(modifier, invocation);
+        for stmt in body.stmts {
+            let _ = self.visit_stmt(stmt);
+        }
+        self.restore_modifier_params(restore);
+    }
+
+    fn bind_modifier_params(
+        &mut self,
+        modifier: &'hir hir::Function<'hir>,
+        invocation: &'hir hir::Modifier<'hir>,
+    ) -> Vec<(hir::VariableId, Option<bool>)> {
+        let mut restore = Vec::new();
+        for &param in modifier.parameters {
+            let tainted = invocation_arg_for_param(self.hir, modifier, invocation, param)
+                .is_some_and(|arg| self.is_tainted(arg));
+            restore.push((param, self.modifier_param_taint.insert(param, tainted)));
+        }
+        restore
+    }
+
+    fn restore_modifier_params(&mut self, restore: Vec<(hir::VariableId, Option<bool>)>) {
+        for (param, previous) in restore {
+            if let Some(previous) = previous {
+                self.modifier_param_taint.insert(param, previous);
+            } else {
+                self.modifier_param_taint.remove(&param);
+            }
         }
     }
 
@@ -553,7 +643,10 @@ impl<'hir> Analyzer<'hir> {
             ExprKind::Ident(reses) => reses.iter().any(|res| match res {
                 Res::Item(ItemId::Variable(var_id)) => {
                     let var = self.hir.variable(*var_id);
-                    matches!(var.kind, hir::VarKind::FunctionParam | hir::VarKind::TryCatch)
+                    matches!(var.kind, hir::VarKind::TryCatch)
+                        || (matches!(var.kind, hir::VarKind::FunctionParam)
+                            && (self.entry_params.contains(var_id)
+                                || self.modifier_param_taint.get(var_id).copied().unwrap_or(false)))
                         || self.taint.get(var_id).copied().unwrap_or(false)
                 }
                 Res::Builtin(_) => true,
@@ -600,6 +693,23 @@ impl<'hir> Analyzer<'hir> {
             if self.access_control_vars.contains(&var_id) && self.emitted_vars.insert(var_id) {
                 self.findings.push(span);
             }
+        }
+    }
+}
+
+fn invocation_arg_for_param<'hir>(
+    hir: &'hir hir::Hir<'hir>,
+    modifier: &'hir hir::Function<'hir>,
+    invocation: &'hir hir::Modifier<'hir>,
+    param: hir::VariableId,
+) -> Option<&'hir hir::Expr<'hir>> {
+    let param_index = modifier.parameters.iter().position(|&id| id == param)?;
+
+    match invocation.args.kind {
+        hir::CallArgsKind::Unnamed(args) => args.get(param_index),
+        hir::CallArgsKind::Named(args) => {
+            let param_name = hir.variable(param).name?.name;
+            args.iter().find(|arg| arg.name.name == param_name).map(|arg| &arg.value)
         }
     }
 }
