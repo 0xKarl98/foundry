@@ -29,20 +29,28 @@ impl<'hir> LateLintPass<'hir> for MissingEventsAccessControl {
         hir: &'hir hir::Hir<'hir>,
         func: &'hir hir::Function<'hir>,
     ) {
+        // This lint only applies to externally reachable, state-changing functions that are
+        // actually gated by access-control logic.
         if !is_entry_point(func) || !is_protected(hir, func) {
             return;
         }
 
         let Some(body) = func.body else { return };
+        // Any event emitted by the function body or its invoked modifiers is treated as
+        // satisfying the audit trail requirement for the protected state update.
         if contains_event(hir, body) || modifiers_contain_event(hir, func) {
             return;
         }
 
+        // Build the set of address state variables used as access-control authorities, including
+        // inline guards and parameterized modifier invocations such as `only(admin)`.
         let access_control_vars = access_control_state_vars(hir, func);
         if access_control_vars.is_empty() {
             return;
         }
 
+        // Analyze both the function body and invoked modifier bodies because either location can
+        // write the protected access-control state during this external call.
         let mut analyzer = Analyzer::new(hir, &access_control_vars, func.parameters);
         for stmt in body.stmts {
             let _ = analyzer.visit_stmt(stmt);
@@ -58,6 +66,7 @@ impl<'hir> LateLintPass<'hir> for MissingEventsAccessControl {
 }
 
 fn is_entry_point(func: &hir::Function<'_>) -> bool {
+    // Limit the lint to ordinary external/public functions that can mutate state after deployment.
     if func.is_constructor() {
         return false;
     }
@@ -69,16 +78,20 @@ fn is_entry_point(func: &hir::Function<'_>) -> bool {
 }
 
 fn is_address_state_var(hir: &hir::Hir<'_>, var_id: hir::VariableId) -> bool {
+    // Access-control authorities tracked by this lint must be address-typed state variables.
     let var = hir.variable(var_id);
     var.kind.is_state() && matches!(var.ty.kind, TypeKind::Elementary(ElementaryType::Address(_)))
 }
 
 fn is_address_local(hir: &hir::Hir<'_>, var_id: hir::VariableId) -> bool {
+    // Local address values can carry taint from user input but are not themselves tracked state.
     let var = hir.variable(var_id);
     !var.kind.is_state() && matches!(var.ty.kind, TypeKind::Elementary(ElementaryType::Address(_)))
 }
 
 fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
+    // A function is protected when either its body or an invoked modifier gates execution on
+    // msg.sender against an access-control value.
     if let Some(body) = func.body
         && body_has_msg_sender_gate(hir, body, false)
     {
@@ -93,6 +106,7 @@ fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
 }
 
 fn body_has_msg_sender_gate(hir: &hir::Hir<'_>, body: hir::Block<'_>, allow_params: bool) -> bool {
+    // Walk a body looking for a msg.sender check that actually gates continued execution.
     let mut visitor = MsgSenderGateVisitor { hir, allow_params, found: false };
     for stmt in body.stmts {
         let _ = visitor.visit_stmt(stmt);
@@ -110,6 +124,8 @@ fn msg_sender_if_gates_execution(
     else_: Option<&hir::Stmt<'_>>,
     allow_params: bool,
 ) -> bool {
+    // An if-condition is a gate only when it compares msg.sender to an access-control value and
+    // the unauthorized branch exits before protected writes can run.
     if !condition_has_access_control_value(hir, cond, allow_params) {
         return false;
     }
@@ -122,6 +138,8 @@ fn msg_sender_if_gates_execution(
 }
 
 fn sender_condition_allows(expr: &hir::Expr<'_>) -> Option<bool> {
+    // Return whether the condition allows execution for msg.sender; None means the shape is
+    // unsupported for access-control gating.
     match &expr.peel_parens().kind {
         ExprKind::Binary(lhs, op, rhs) if contains_msg_sender(lhs) || contains_msg_sender(rhs) => {
             match op.kind {
@@ -139,6 +157,7 @@ fn sender_condition_allows(expr: &hir::Expr<'_>) -> Option<bool> {
 }
 
 fn stmt_exits(stmt: &hir::Stmt<'_>) -> bool {
+    // Conservatively identify statements that stop execution before a protected write can run.
     match stmt.kind {
         StmtKind::Return(_) | StmtKind::Revert(_) => true,
         StmtKind::Block(block) | StmtKind::UncheckedBlock(block) => block_exits(block),
@@ -148,9 +167,11 @@ fn stmt_exits(stmt: &hir::Stmt<'_>) -> bool {
 }
 
 fn block_exits(block: hir::Block<'_>) -> bool {
+    // A block exits only if its final statement exits on all reachable paths.
     block.stmts.last().is_some_and(stmt_exits)
 }
 
+// Finds require/assert checks and if-guards that constrain execution by msg.sender.
 struct MsgSenderGateVisitor<'hir> {
     hir: &'hir hir::Hir<'hir>,
     allow_params: bool,
@@ -165,6 +186,7 @@ impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
     }
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
+        // Treat if-statements as guards only when the unauthorized path exits.
         if let StmtKind::If(cond, then, else_) = stmt.kind
             && msg_sender_if_gates_execution(self.hir, cond, then, else_, self.allow_params)
         {
@@ -175,6 +197,8 @@ impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
     }
 
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
+        // require/assert calls are guards only when their condition compares msg.sender with an
+        // access-control value.
         if let ExprKind::Call(callee, args, _) = &expr.kind
             && is_require_or_assert(callee)
             && args.exprs().next().is_some_and(|cond| {
@@ -189,6 +213,7 @@ impl<'hir> Visit<'hir> for MsgSenderGateVisitor<'hir> {
 }
 
 fn is_require_or_assert(callee: &hir::Expr<'_>) -> bool {
+    // Only Solidity builtins are treated as guard calls; user-defined functions are ignored.
     if let ExprKind::Ident(reses) = &callee.kind {
         return reses.iter().any(|res| {
             if let Res::Builtin(builtin) = res {
@@ -203,6 +228,7 @@ fn is_require_or_assert(callee: &hir::Expr<'_>) -> bool {
 }
 
 fn contains_msg_sender(expr: &hir::Expr<'_>) -> bool {
+    // Recursively inspect an expression tree for the concrete msg.sender member access.
     if is_msg_sender(expr) {
         return true;
     }
@@ -238,6 +264,8 @@ fn contains_msg_sender(expr: &hir::Expr<'_>) -> bool {
 }
 
 fn collect_state_vars(expr: &hir::Expr<'_>, out: &mut HashSet<hir::VariableId>) {
+    // Collect variable references from an expression so callers can filter state/address
+    // candidates.
     match &expr.kind {
         ExprKind::Ident(reses) => {
             for res in *reses {
@@ -300,6 +328,7 @@ fn collect_state_vars(expr: &hir::Expr<'_>, out: &mut HashSet<hir::VariableId>) 
 }
 
 fn is_msg_sender(expr: &hir::Expr<'_>) -> bool {
+    // Match the builtin msg.sender access exactly, not user-defined lookalikes.
     matches!(
         &expr.kind,
         ExprKind::Member(base, member)
@@ -315,6 +344,7 @@ fn is_msg_sender(expr: &hir::Expr<'_>) -> bool {
 }
 
 fn modifiers_contain_event(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
+    // Events emitted from invoked modifiers also satisfy the lint's event requirement.
     func.modifiers.iter().any(|invocation| {
         let Some(modifier_id) = invocation.id.as_function() else { return false };
         let modifier = hir.function(modifier_id);
@@ -323,6 +353,7 @@ fn modifiers_contain_event(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool
 }
 
 fn contains_event(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
+    // Scan a body for any emit statement, including nested statements reached by the visitor.
     let mut visitor = EventVisitor { hir, found: false };
     for stmt in body.stmts {
         let _ = visitor.visit_stmt(stmt);
@@ -333,6 +364,7 @@ fn contains_event(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
     false
 }
 
+// Finds whether a body emits an event.
 struct EventVisitor<'hir> {
     hir: &'hir hir::Hir<'hir>,
     found: bool,
@@ -346,6 +378,7 @@ impl<'hir> Visit<'hir> for EventVisitor<'hir> {
     }
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
+        // Any emit statement is enough; this lint does not validate event names or arguments.
         if matches!(stmt.kind, StmtKind::Emit(_)) {
             self.found = true;
             return ControlFlow::Continue(());
@@ -358,14 +391,17 @@ fn access_control_state_vars(
     hir: &hir::Hir<'_>,
     func: &hir::Function<'_>,
 ) -> HashSet<hir::VariableId> {
+    // Collect address state variables that act as authorities for access control in this contract.
     let mut reads = HashSet::new();
 
     if let Some(body) = func.body {
+        // Include inline guards such as `require(msg.sender == owner)` in the current function.
         collect_body_access_control_state_vars(hir, body, &mut reads);
     }
 
     let Some(contract_id) = func.contract else { return reads };
 
+    // Include state variables read directly by access-control modifier definitions.
     for item in hir.contract_items(contract_id) {
         let hir::Item::Function(modifier) = item else { continue };
         if !matches!(modifier.kind, hir::FunctionKind::Modifier) {
@@ -385,6 +421,8 @@ fn access_control_state_vars(
         );
     }
 
+    // Include state variables passed into parameterized access-control modifiers like
+    // `only(admin)`.
     for item in hir.contract_items(contract_id) {
         let hir::Item::Function(func) = item else { continue };
         for invocation in func.modifiers {
@@ -396,6 +434,7 @@ fn access_control_state_vars(
 }
 
 fn is_access_control_modifier(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
+    // Modifier parameters may stand for access-control authorities at each invocation site.
     body_has_msg_sender_gate(hir, body, true)
 }
 
@@ -404,6 +443,8 @@ fn collect_invocation_access_control_vars(
     invocation: &hir::Modifier<'_>,
     out: &mut HashSet<hir::VariableId>,
 ) {
+    // Map authority reads inside a parameterized modifier back to the state variables passed by
+    // this invocation.
     let Some(modifier_id) = invocation.id.as_function() else { return };
     let modifier = hir.function(modifier_id);
     let Some(body) = modifier.body else { return };
@@ -423,6 +464,8 @@ fn collect_invocation_access_control_vars(
     }
 
     for param in collector.params {
+        // For `modifier only(address who)`, an invocation `only(admin)` makes `admin` the
+        // authority.
         let Some(arg) = invocation_arg_for_param(hir, modifier, invocation, param) else {
             continue;
         };
@@ -432,6 +475,7 @@ fn collect_invocation_access_control_vars(
     }
 }
 
+// Collects state variables and modifier parameters that are read in msg.sender guard conditions.
 struct AccessControlReadCollector<'hir> {
     hir: &'hir hir::Hir<'hir>,
     state_vars: HashSet<hir::VariableId>,
@@ -444,6 +488,7 @@ impl<'hir> AccessControlReadCollector<'hir> {
     }
 
     fn collect_access_vars(&mut self, expr: &'hir hir::Expr<'hir>) {
+        // In a sender guard, only the side opposite msg.sender can name the access authority.
         match &expr.kind {
             ExprKind::Binary(lhs, op, rhs) if matches!(op.kind, BinOpKind::Eq | BinOpKind::Ne) => {
                 if contains_msg_sender(lhs) {
@@ -482,6 +527,8 @@ impl<'hir> AccessControlReadCollector<'hir> {
     }
 
     fn collect_non_sender_vars(&mut self, expr: &'hir hir::Expr<'hir>) {
+        // Record authority candidates from the non-sender side: state vars directly, params for
+        // later invocation-site mapping.
         match &expr.kind {
             ExprKind::Ident(reses) => {
                 for res in *reses {
@@ -554,6 +601,8 @@ fn condition_has_access_control_value(
     expr: &hir::Expr<'_>,
     allow_params: bool,
 ) -> bool {
+    // A sender condition is access control only if it references an address state authority, or an
+    // allowed modifier parameter that can map to one.
     let mut collector = AccessControlReadCollector::new(hir);
     collector.collect_access_vars(expr);
     (allow_params && collector.params.iter().any(|&var_id| is_address_local(hir, var_id)))
@@ -565,6 +614,7 @@ fn collect_body_access_control_state_vars(
     body: hir::Block<'_>,
     out: &mut HashSet<hir::VariableId>,
 ) {
+    // Collect access-control authorities from inline guards in a function body.
     let mut collector = AccessControlReadCollector::new(hir);
     for stmt in body.stmts {
         let _ = collector.visit_stmt(stmt);
@@ -574,6 +624,7 @@ fn collect_body_access_control_state_vars(
     );
 }
 
+// Visits guard-shaped code to collect the authority variables referenced by msg.sender checks.
 impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     type BreakValue = Never;
 
@@ -582,6 +633,7 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     }
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
+        // Only if-statements that truly gate execution contribute access-control reads.
         if let StmtKind::If(cond, then, else_) = stmt.kind {
             if msg_sender_if_gates_execution(self.hir, cond, then, else_, true) {
                 self.collect_access_vars(cond);
@@ -598,6 +650,8 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
         match &expr.kind {
             ExprKind::Call(callee, args, _) if is_require_or_assert(callee) => {
+                // require/assert conditions contribute reads only when they compare against an
+                // access-control value.
                 if let Some(cond) = args.exprs().next()
                     && condition_has_access_control_value(self.hir, cond, true)
                 {
@@ -606,6 +660,8 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
                 return ControlFlow::Continue(());
             }
             ExprKind::Assign(lhs, op, rhs) => {
+                // Assignments are not guards; visit only value-producing sides to avoid counting a
+                // plain lhs write as an access-control read.
                 if op.is_some() {
                     let _ = self.visit_expr(lhs);
                 }
@@ -619,6 +675,7 @@ impl<'hir> Visit<'hir> for AccessControlReadCollector<'hir> {
     }
 }
 
+// Tracks tainted address values and reports tainted writes into access-control state variables.
 struct Analyzer<'hir> {
     hir: &'hir hir::Hir<'hir>,
     access_control_vars: &'hir HashSet<hir::VariableId>,
@@ -647,6 +704,7 @@ impl<'hir> Analyzer<'hir> {
     }
 
     fn visit_modifier_invocation(&mut self, invocation: &'hir hir::Modifier<'hir>) {
+        // Analyze modifier bodies in call context so writes inside modifiers are checked too.
         let Some(modifier_id) = invocation.id.as_function() else { return };
         let modifier = self.hir.function(modifier_id);
         let Some(body) = modifier.body else { return };
@@ -663,6 +721,7 @@ impl<'hir> Analyzer<'hir> {
         modifier: &'hir hir::Function<'hir>,
         invocation: &'hir hir::Modifier<'hir>,
     ) -> Vec<(hir::VariableId, Option<bool>)> {
+        // Temporarily bind modifier parameters to the taint of this invocation's arguments.
         let mut restore = Vec::new();
         for &param in modifier.parameters {
             let tainted = invocation_arg_for_param(self.hir, modifier, invocation, param)
@@ -673,6 +732,7 @@ impl<'hir> Analyzer<'hir> {
     }
 
     fn restore_modifier_params(&mut self, restore: Vec<(hir::VariableId, Option<bool>)>) {
+        // Restore previous modifier parameter bindings after leaving the modifier body.
         for (param, previous) in restore {
             if let Some(previous) = previous {
                 self.modifier_param_taint.insert(param, previous);
@@ -683,6 +743,8 @@ impl<'hir> Analyzer<'hir> {
     }
 
     fn is_tainted(&self, expr: &hir::Expr<'_>) -> bool {
+        // Taint means the value can originate from an entry parameter, modifier argument, builtin,
+        // try/catch binding, allocation, or another tainted expression.
         match &expr.kind {
             ExprKind::Ident(reses) => reses.iter().any(|res| match res {
                 Res::Item(ItemId::Variable(var_id)) => {
@@ -727,6 +789,7 @@ impl<'hir> Analyzer<'hir> {
     }
 
     fn record_write(&mut self, lhs: &hir::Expr<'hir>, rhs: Option<&hir::Expr<'hir>>) {
+        // Warn only for tainted writes to known access-control state variables, once per variable.
         let tainted = rhs.is_none_or(|expr| self.is_tainted(expr));
         if !tainted {
             return;
@@ -740,6 +803,7 @@ impl<'hir> Analyzer<'hir> {
     }
 
     fn param_taint(&self, var_id: hir::VariableId) -> bool {
+        // Explicit local taint assignments override the default entry/modifier parameter taint.
         self.taint.get(&var_id).copied().unwrap_or_else(|| {
             self.entry_params.contains(&var_id)
                 || self.modifier_param_taint.get(&var_id).copied().unwrap_or(false)
@@ -753,6 +817,7 @@ fn invocation_arg_for_param<'hir>(
     invocation: &'hir hir::Modifier<'hir>,
     param: hir::VariableId,
 ) -> Option<&'hir hir::Expr<'hir>> {
+    // Resolve both positional and named modifier arguments to the requested modifier parameter.
     let param_index = modifier.parameters.iter().position(|&id| id == param)?;
 
     match invocation.args.kind {
@@ -764,6 +829,7 @@ fn invocation_arg_for_param<'hir>(
     }
 }
 
+// Walks executable code to detect tainted writes to protected access-control state.
 impl<'hir> Visit<'hir> for Analyzer<'hir> {
     type BreakValue = Never;
 
@@ -772,6 +838,7 @@ impl<'hir> Visit<'hir> for Analyzer<'hir> {
     }
 
     fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'hir>) -> ControlFlow<Self::BreakValue> {
+        // Initialize local address taint from declaration initializers.
         if let StmtKind::DeclSingle(var_id) = stmt.kind {
             let var = self.hir.variable(var_id);
             if let Some(init) = var.initializer
@@ -786,6 +853,7 @@ impl<'hir> Visit<'hir> for Analyzer<'hir> {
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
         match &expr.kind {
             ExprKind::Assign(lhs, _, rhs) => {
+                // First check state writes, then update local alias taint for subsequent writes.
                 self.record_write(lhs, Some(rhs));
 
                 if let Some(local) = lhs_local_var(self.hir, lhs) {
@@ -802,6 +870,7 @@ impl<'hir> Visit<'hir> for Analyzer<'hir> {
 }
 
 fn lhs_local_var(hir: &hir::Hir<'_>, lhs: &hir::Expr<'_>) -> Option<hir::VariableId> {
+    // Local address assignments update taint aliases; state writes are handled separately.
     if let ExprKind::Ident(reses) = &lhs.kind {
         for res in *reses {
             if let Res::Item(ItemId::Variable(var_id)) = res
@@ -818,6 +887,7 @@ fn state_write_lhs_vars(
     hir: &hir::Hir<'_>,
     expr: &hir::Expr<'_>,
 ) -> Vec<(hir::VariableId, solar::interface::Span)> {
+    // Return every distinct state variable written by this left-hand side expression.
     let mut vars = Vec::new();
     collect_state_write_lhs_vars(hir, expr, &mut vars);
     vars
@@ -828,6 +898,7 @@ fn collect_state_write_lhs_vars(
     expr: &hir::Expr<'_>,
     vars: &mut Vec<(hir::VariableId, solar::interface::Span)>,
 ) {
+    // Peel writable lhs shapes so tuple/member/index assignments report the underlying state var.
     match &expr.kind {
         ExprKind::Ident(reses) => {
             for res in *reses {
