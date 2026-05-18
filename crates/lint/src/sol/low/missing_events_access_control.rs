@@ -85,8 +85,7 @@ fn is_protected(hir: &hir::Hir<'_>, func: &hir::Function<'_>) -> bool {
     func.modifiers.iter().any(|invocation| {
         let Some(modifier_id) = invocation.id.as_function() else { return false };
         let modifier = hir.function(modifier_id);
-        modifier.name.is_some_and(|name| name.as_str() == "onlyOwner")
-            || modifier.body.is_some_and(|body| body_has_msg_sender_check(hir, body))
+        modifier.body.is_some_and(|body| body_has_msg_sender_check(hir, body))
     })
 }
 
@@ -314,7 +313,7 @@ fn contract_modifier_state_reads(
             continue;
         }
         let Some(body) = modifier.body else { continue };
-        if !is_access_control_modifier(hir, modifier, body) {
+        if !is_access_control_modifier(hir, body) {
             continue;
         }
 
@@ -334,13 +333,8 @@ fn contract_modifier_state_reads(
     reads
 }
 
-fn is_access_control_modifier(
-    hir: &hir::Hir<'_>,
-    modifier: &hir::Function<'_>,
-    body: hir::Block<'_>,
-) -> bool {
-    modifier.name.is_some_and(|name| name.as_str() == "onlyOwner")
-        || body_has_msg_sender_check(hir, body)
+fn is_access_control_modifier(hir: &hir::Hir<'_>, body: hir::Block<'_>) -> bool {
+    body_has_msg_sender_check(hir, body)
 }
 
 fn collect_invocation_access_control_vars(
@@ -351,7 +345,7 @@ fn collect_invocation_access_control_vars(
     let Some(modifier_id) = invocation.id.as_function() else { return };
     let modifier = hir.function(modifier_id);
     let Some(body) = modifier.body else { return };
-    if !is_access_control_modifier(hir, modifier, body) {
+    if !is_access_control_modifier(hir, body) {
         return;
     }
 

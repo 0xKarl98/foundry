@@ -132,3 +132,17 @@ contract MissingEventsAccessControl is BaseOwner {
         threshold = newThreshold;
     }
 }
+
+contract MisleadingModifierName {
+    address public owner;
+    bool public flag = true;
+
+    modifier onlyOwner() {
+        require(flag, "paused");
+        _;
+    }
+
+    function setOwner(address newOwner) external onlyOwner {
+        owner = newOwner;
+    }
+}
