@@ -110,6 +110,13 @@ contract MissingEventsAccessControl is BaseOwner {
     // The externally callable function is empty, but the invoked modifier writes owner.
     function transferOwnershipInModifier(address newOwner) external onlyOwner writesOwner(newOwner) {}
 
+    // Constant authority updates still change access control and should emit an event.
+    function setOwnerViaClearedAlias(address newOwner) external onlyOwner {
+        address nextOwner = newOwner;
+        nextOwner = address(0x1234);
+        owner = nextOwner; //~WARN: access control state change should emit an event
+    }
+
     // SHOULD NOT WARN:
 
     // The protected authority update already emits an event in the function body.
@@ -145,13 +152,6 @@ contract MissingEventsAccessControl is BaseOwner {
     // A modifier with no sender gate should not make this function protected.
     function setAdminWithNonAccessModifier(address newAdmin) external nonAccessControl {
         admin = newAdmin;
-    }
-
-    // Reassigning the local alias to a constant clears parameter taint before the owner write.
-    function setOwnerViaClearedAlias(address newOwner) external onlyOwner {
-        address nextOwner = newOwner;
-        nextOwner = address(0x1234);
-        owner = nextOwner;
     }
 
     // Missing access control is a separate lint; this rule only checks protected authority updates.
@@ -216,7 +216,33 @@ contract NonAccessSenderRequire {
     }
 }
 
-contract ClearedParameterTaint {
+contract NegativeSenderAuthorityRequire {
+    address public owner;
+
+    // Negative sender checks do not protect the authority; they exclude it.
+    function setOwnerWhenNotOwner(address newOwner) external {
+        require(msg.sender != owner, "owner not allowed");
+        owner = newOwner;
+    }
+}
+
+contract UserChosenModifierAuthority {
+    address public owner;
+
+    modifier only(address who) {
+        require(msg.sender == who, "not authorized");
+        _;
+    }
+
+    function ownerAction() external only(owner) {}
+
+    // The caller controls `who`, so this invocation is not an authority-backed guard.
+    function setOwner(address who, address newOwner) external only(who) {
+        owner = newOwner;
+    }
+}
+
+contract ConstantAuthorityUpdate {
     address public owner;
 
     modifier onlyOwner() {
@@ -224,10 +250,10 @@ contract ClearedParameterTaint {
         _;
     }
 
-    // Assigning a constant to an original parameter should clear its entry-parameter taint.
-    function setOwnerViaClearedParam(address newOwner) external onlyOwner {
+    // Overwriting a parameter with a constant still changes the owner authority.
+    function setOwnerViaConstantParam(address newOwner) external onlyOwner {
         newOwner = address(0x1234);
-        owner = newOwner;
+        owner = newOwner; //~WARN: access control state change should emit an event
     }
 }
 
