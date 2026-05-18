@@ -263,64 +263,69 @@ fn contains_msg_sender(expr: &hir::Expr<'_>) -> bool {
     }
 }
 
-fn collect_state_vars(expr: &hir::Expr<'_>, out: &mut HashSet<hir::VariableId>) {
-    // Collect variable references from an expression so callers can filter state/address
-    // candidates.
+fn collect_address_state_vars(
+    hir: &hir::Hir<'_>,
+    expr: &hir::Expr<'_>,
+    out: &mut HashSet<hir::VariableId>,
+) {
+    // Stream address state variables from an expression directly into the caller's set.
     match &expr.kind {
         ExprKind::Ident(reses) => {
             for res in *reses {
-                if let Res::Item(ItemId::Variable(var_id)) = res {
+                if let Res::Item(ItemId::Variable(var_id)) = res
+                    && is_address_state_var(hir, *var_id)
+                {
                     out.insert(*var_id);
                 }
             }
         }
         ExprKind::Assign(lhs, _, rhs) | ExprKind::Binary(lhs, _, rhs) => {
-            collect_state_vars(lhs, out);
-            collect_state_vars(rhs, out);
+            collect_address_state_vars(hir, lhs, out);
+            collect_address_state_vars(hir, rhs, out);
         }
         ExprKind::Call(callee, args, opts) => {
-            collect_state_vars(callee, out);
+            collect_address_state_vars(hir, callee, out);
             for arg in args.exprs() {
-                collect_state_vars(arg, out);
+                collect_address_state_vars(hir, arg, out);
             }
             if let Some(opts) = opts {
                 for opt in *opts {
-                    collect_state_vars(&opt.value, out);
+                    collect_address_state_vars(hir, &opt.value, out);
                 }
             }
         }
         ExprKind::Delete(inner)
         | ExprKind::Member(inner, _)
         | ExprKind::Payable(inner)
-        | ExprKind::Unary(_, inner) => collect_state_vars(inner, out),
+        | ExprKind::Unary(_, inner) => collect_address_state_vars(hir, inner, out),
         ExprKind::Index(base, index) => {
-            collect_state_vars(base, out);
+            collect_address_state_vars(hir, base, out);
             if let Some(index) = index {
-                collect_state_vars(index, out);
+                collect_address_state_vars(hir, index, out);
             }
         }
         ExprKind::Slice(base, start, end) => {
-            collect_state_vars(base, out);
+            collect_address_state_vars(hir, base, out);
             if let Some(start) = start {
-                collect_state_vars(start, out);
+                collect_address_state_vars(hir, start, out);
             }
             if let Some(end) = end {
-                collect_state_vars(end, out);
+                collect_address_state_vars(hir, end, out);
             }
         }
         ExprKind::Ternary(cond, then, else_) => {
-            collect_state_vars(cond, out);
-            collect_state_vars(then, out);
-            collect_state_vars(else_, out);
+            collect_address_state_vars(hir, cond, out);
+            collect_address_state_vars(hir, then, out);
+            collect_address_state_vars(hir, else_, out);
         }
         ExprKind::Tuple(exprs) => {
             for expr in exprs.iter().copied().flatten() {
-                collect_state_vars(expr, out);
+                collect_address_state_vars(hir, expr, out);
             }
         }
         ExprKind::Array(exprs) => {
             for expr in *exprs {
-                collect_state_vars(expr, out);
+                collect_address_state_vars(hir, expr, out);
             }
         }
         _ => {}
@@ -469,9 +474,7 @@ fn collect_invocation_access_control_vars(
         let Some(arg) = invocation_arg_for_param(hir, modifier, invocation, param) else {
             continue;
         };
-        let mut arg_vars = HashSet::new();
-        collect_state_vars(arg, &mut arg_vars);
-        out.extend(arg_vars.into_iter().filter(|&var_id| is_address_state_var(hir, var_id)));
+        collect_address_state_vars(hir, arg, out);
     }
 }
 
@@ -722,7 +725,7 @@ impl<'hir> Analyzer<'hir> {
         invocation: &'hir hir::Modifier<'hir>,
     ) -> Vec<(hir::VariableId, Option<bool>)> {
         // Temporarily bind modifier parameters to the taint of this invocation's arguments.
-        let mut restore = Vec::new();
+        let mut restore = Vec::with_capacity(modifier.parameters.len());
         for &param in modifier.parameters {
             let tainted = invocation_arg_for_param(self.hir, modifier, invocation, param)
                 .is_some_and(|arg| self.is_tainted(arg));
@@ -795,11 +798,11 @@ impl<'hir> Analyzer<'hir> {
             return;
         }
 
-        for (var_id, span) in state_write_lhs_vars(self.hir, lhs) {
+        visit_state_write_lhs_vars(self.hir, lhs, &mut |var_id, span| {
             if self.access_control_vars.contains(&var_id) && self.emitted_vars.insert(var_id) {
                 self.findings.push(span);
             }
-        }
+        });
     }
 
     fn param_taint(&self, var_id: hir::VariableId) -> bool {
@@ -883,43 +886,32 @@ fn lhs_local_var(hir: &hir::Hir<'_>, lhs: &hir::Expr<'_>) -> Option<hir::Variabl
     None
 }
 
-fn state_write_lhs_vars(
+fn visit_state_write_lhs_vars(
     hir: &hir::Hir<'_>,
     expr: &hir::Expr<'_>,
-) -> Vec<(hir::VariableId, solar::interface::Span)> {
-    // Return every distinct state variable written by this left-hand side expression.
-    let mut vars = Vec::new();
-    collect_state_write_lhs_vars(hir, expr, &mut vars);
-    vars
-}
-
-fn collect_state_write_lhs_vars(
-    hir: &hir::Hir<'_>,
-    expr: &hir::Expr<'_>,
-    vars: &mut Vec<(hir::VariableId, solar::interface::Span)>,
+    visit: &mut impl FnMut(hir::VariableId, solar::interface::Span),
 ) {
-    // Peel writable lhs shapes so tuple/member/index assignments report the underlying state var.
+    // Peel writable lhs shapes and stream each underlying state var directly to the caller.
     match &expr.kind {
         ExprKind::Ident(reses) => {
             for res in *reses {
                 if let Res::Item(ItemId::Variable(var_id)) = res
                     && hir.variable(*var_id).kind.is_state()
-                    && !vars.iter().any(|(existing, _)| existing == var_id)
                 {
-                    vars.push((*var_id, expr.span));
+                    visit(*var_id, expr.span);
                 }
             }
         }
         ExprKind::Index(base, _) | ExprKind::Slice(base, ..) => {
-            collect_state_write_lhs_vars(hir, base, vars);
+            visit_state_write_lhs_vars(hir, base, visit);
         }
         ExprKind::Member(base, _)
         | ExprKind::Payable(base)
         | ExprKind::Unary(_, base)
-        | ExprKind::Delete(base) => collect_state_write_lhs_vars(hir, base, vars),
+        | ExprKind::Delete(base) => visit_state_write_lhs_vars(hir, base, visit),
         ExprKind::Tuple(exprs) => {
             for expr in exprs.iter().copied().flatten() {
-                collect_state_write_lhs_vars(hir, expr, vars);
+                visit_state_write_lhs_vars(hir, expr, visit);
             }
         }
         _ => {}
