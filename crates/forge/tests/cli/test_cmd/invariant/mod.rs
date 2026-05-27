@@ -1250,6 +1250,10 @@ contract JsonInvariantReportTest is Test {
     let tests = suite["test_results"].as_object().unwrap();
     assert_eq!(tests.len(), 1);
     let result = tests.values().next().unwrap();
+    let failures = result["invariant_failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].get("is_anchor").is_none());
+
     let predicates = result["invariant_predicate_results"].as_array().unwrap();
     assert_eq!(predicates.len(), 2);
 
@@ -1308,6 +1312,8 @@ contract SkipPredicateReportTest is Test {
     );
     assert!(stdout.contains("[PASS] invariant_live"), "{stdout}");
     assert!(stdout.contains("[SKIP: secondary] invariant_skipped"), "{stdout}");
+    assert!(stdout.contains(" Invariant/Property Tests (runs:"), "{stdout}");
+    assert!(!stdout.contains(" invariant_live() (runs:"), "{stdout}");
     assert!(stdout.contains("Suite result: ok. 1 passed; 0 failed; 1 skipped;"), "{stdout}");
 });
 
@@ -2149,6 +2155,61 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 [SEED] (use `--fuzz-seed` to reproduce)
 
 "#]]);
+});
+
+// Verifies the persisted-primary replay fast path keeps the campaign-level output label instead
+// of falling back to the primary invariant anchor name.
+forgetest_init!(persisted_anchor_replay_uses_campaign_label, |prj, cmd| {
+    prj.update_config(|config| {
+        config.invariant.runs = 5;
+        config.invariant.depth = 50;
+    });
+    prj.add_source(
+        "Counter.sol",
+        r#"
+contract Counter {
+    uint256 public cond;
+
+    function inc() public {
+        cond++;
+    }
+}
+   "#,
+    );
+    prj.add_test(
+        "PersistedAnchorReplayTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+import {Counter} from "../src/Counter.sol";
+
+contract PersistedAnchorReplayTest is Test {
+    Counter public counter;
+
+    function setUp() public {
+        counter = new Counter();
+        targetContract(address(counter));
+    }
+
+    function invariant_anchor_breakable() public view {
+        require(counter.cond() < 2, "anchor broken");
+    }
+
+    function invariant_secondary_safe() public view {
+        require(counter.cond() < 1000000, "safe broken");
+    }
+}
+   "#,
+    );
+
+    cmd.args(["test", "--mt", "invariant_"]).assert_failure();
+
+    let output = cmd.forge_fuse().args(["test", "--mt", "invariant_"]).assert_failure();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("Replayed invariant failure from persisted file."), "{stderr}");
+    assert!(stdout.contains("[FAIL: anchor broken]"), "{stdout}");
+    assert!(stdout.contains(" Invariant/Property Tests (runs:"), "{stdout}");
+    assert!(!stdout.contains(" invariant_anchor_breakable() (runs:"), "{stdout}");
 });
 
 // Verifies that when the campaign anchor passes but another selected predicate fails, the report

@@ -436,9 +436,9 @@ pub enum InvariantFailure {
         counterexample: Option<CounterExample>,
         /// Path where the counterexample was persisted for re-running and shrinking.
         persisted_path: std::path::PathBuf,
-        /// Whether this failure is the stable campaign anchor. Anchor failures keep the compact
-        /// render by omitting the function name on the primary `[FAIL: ...]` line.
-        #[serde(default)]
+        /// Whether this failure is the stable campaign anchor. This is an internal rendering hint
+        /// and is not part of the user-facing JSON output.
+        #[serde(default, skip_serializing)]
         is_anchor: bool,
     },
     /// A handler-side assertion bug discovered during the campaign.
@@ -732,7 +732,7 @@ impl TestResult {
         writeln!(
             s,
             "\n{}: {}/{total} invariants broken",
-            if user_facing { "Invariant/Property Tests" } else { "Predicates" },
+            if user_facing { INVARIANT_CAMPAIGN_DISPLAY_NAME } else { "Predicates" },
             self.invariant_failures.len()
         )
         .unwrap();
@@ -798,7 +798,7 @@ impl TestResult {
 
         if show_header {
             s.push('\n');
-            s.push_str(if user_facing { "Invariant/Property Tests" } else { "Predicates" });
+            s.push_str(if user_facing { INVARIANT_CAMPAIGN_DISPLAY_NAME } else { "Predicates" });
             s.push_str(":\n");
         }
 
@@ -988,9 +988,10 @@ impl TestResult {
     pub fn invariant_replay_fail(
         &mut self,
         replayed_entirely: bool,
-        invariant_name: &String,
+        display_name: &str,
         replay_reason: Option<String>,
         call_sequence: Vec<BaseCounterExample>,
+        invariant_count: Option<usize>,
     ) {
         self.kind = TestKind::Invariant {
             runs: 1,
@@ -1003,12 +1004,13 @@ impl TestResult {
         self.status = TestStatus::Failure;
         self.reason = replay_reason.or_else(|| {
             if replayed_entirely {
-                Some(format!("{invariant_name} replay failure"))
+                Some(format!("{display_name} replay failure"))
             } else {
-                Some(format!("{invariant_name} persisted failure revert"))
+                Some(format!("{display_name} persisted failure revert"))
             }
         });
         self.counterexample = Some(CounterExample::Sequence(call_sequence.len(), call_sequence));
+        self.invariant_count = invariant_count;
     }
 
     /// Returns the fail result for invariant test setup.
@@ -1138,20 +1140,12 @@ impl TestResult {
                 })
                 .join("\n");
         }
-        let name = self.short_result_name(name);
-        format!("{} {name} {}", self.render_status_block(true), self.kind.report())
-    }
-
-    fn short_result_name<'a>(&self, name: &'a str) -> &'a str {
-        if self.uses_invariant_campaign_display_name() {
+        let name = if self.kind.is_invariant() && self.invariant_count.is_some() {
             INVARIANT_CAMPAIGN_DISPLAY_NAME
         } else {
             name
-        }
-    }
-
-    fn uses_invariant_campaign_display_name(&self) -> bool {
-        self.kind.is_invariant() && self.invariant_count.is_some()
+        };
+        format!("{} {name} {}", self.render_status_block(true), self.kind.report())
     }
 
     fn logical_count(&self) -> usize {

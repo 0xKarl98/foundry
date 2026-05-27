@@ -1023,16 +1023,19 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             &self.cr.contract.abi,
         );
         let show_solidity = invariant_config.show_solidity;
-        let invariant_campaign_name = if invariant_contract.invariant_fns.len() > 1 {
-            INVARIANT_CAMPAIGN_DISPLAY_NAME.to_string()
+        let logical_invariant_count =
+            invariant_contract.invariant_fns.len() + skipped_predicate_results.len();
+        let invariant_count = (logical_invariant_count > 1).then_some(logical_invariant_count);
+        let invariant_campaign_name = if invariant_count.is_some() {
+            INVARIANT_CAMPAIGN_DISPLAY_NAME
         } else {
-            invariant_contract.anchor().name.clone()
+            invariant_contract.anchor().name.as_str()
         };
 
         let progress = start_fuzz_progress(
             self.cr.progress,
             self.cr.name,
-            &invariant_campaign_name,
+            invariant_campaign_name,
             invariant_config.timeout,
             invariant_config.runs,
         );
@@ -1064,9 +1067,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             if let Ok((success, replayed_entirely, replay_reason)) = replay
                 && !success
             {
-                let warn =
-                    "Replayed invariant failure from persisted file. \nRun `forge clean` or remove file to ignore failure and to continue invariant test campaign."
-                        .to_string();
+                let warn = "Replayed invariant failure from persisted file. \nRun `forge clean` or remove file to ignore failure and to continue invariant test campaign.";
 
                 if let Some(ref progress) = progress {
                     progress.set_prefix(format!("{invariant_campaign_name}\n{warn}\n"));
@@ -1114,9 +1115,10 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
 
                 self.result.invariant_replay_fail(
                     replayed_entirely,
-                    &invariant_contract.anchor().name,
+                    invariant_campaign_name,
                     replay_reason,
                     call_sequence,
+                    invariant_count,
                 );
                 return self.result;
             }
@@ -1377,12 +1379,6 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         }
 
         let invariant_failure_dir = any_failure_persisted.then(|| failure_dir.clone());
-        // Only attach a campaign-level roll-up when this run actually exercised >1 predicate.
-        // Single-predicate runs keep the legacy single-block render with no roll-up line.
-        let invariant_count = (invariant_contract.invariant_fns.len()
-            + skipped_predicate_results.len()
-            > 1)
-        .then_some(invariant_contract.invariant_fns.len() + skipped_predicate_results.len());
         let invariant_predicate_results = if invariant_count.is_some() {
             let failures_by_name = invariant_failures
                 .iter()
