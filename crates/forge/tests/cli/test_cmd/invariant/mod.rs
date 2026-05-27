@@ -214,7 +214,7 @@ contract AnotherCounterHandler is Test {
 Invariant/Property Tests:
 [PASS] invariant_counter
 [PASS] invariant_counter2
- invariant_counter() (runs: 10, calls: 5000, reverts: [..])
+ Invariant/Property Tests (runs: 10, calls: 5000, reverts: [..])
 
 ╭-----------------------+----------------+-------+---------+----------╮
 | Contract              | Selector       | Calls | Reverts | Discards |
@@ -857,7 +857,7 @@ Invariant/Property Tests:
 [PASS] invariant_foo_called
 [PASS] invariant_setUp_considered_target
 [PASS] invariant_testSanity_considered_target
- invariant_considered_target() (runs: 10, calls: 1000, reverts: 0)
+ Invariant/Property Tests (runs: 10, calls: 1000, reverts: 0)
 
 ╭---------------------+----------+-------+---------+----------╮
 | Contract            | Selector | Calls | Reverts | Discards |
@@ -2111,7 +2111,7 @@ Invariant/Property Tests: 2/2 invariants broken
 [FAIL: first broken] invariant_first
 [FAIL: second broken] invariant_second
 2 invariant failure(s) persisted to [..]/cache/invariant/failures/StaleSecondaryTest — rerun to shrink
- invariant_first() (runs: 1, calls: 3, reverts: 0)
+ Invariant/Property Tests (runs: 1, calls: 3, reverts: 0)
 
 ╭----------+----------+-------+---------+----------╮
 | Contract | Selector | Calls | Reverts | Discards |
@@ -2140,7 +2140,7 @@ Invariant/Property Tests: 2/2 invariants broken
 [FAIL: first broken] invariant_first
 [FAIL: second broken] invariant_second
 2 invariant failure(s) persisted to [..]/cache/invariant/failures/StaleSecondaryTest — rerun to shrink
- invariant_first() (runs: 1, calls: 3, reverts: 0)
+ Invariant/Property Tests (runs: 1, calls: 3, reverts: 0)
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
@@ -2203,7 +2203,8 @@ contract SecondaryOnlyTest is Test {
     assert!(stdout.contains("[FAIL: breakable broken] invariant_secondary_breakable"), "{stdout}");
     assert!(stdout.contains("Invariant/Property Tests: 1/2 invariants broken"), "{stdout}");
     assert!(stdout.contains("[PASS] invariant_anchor_safe"), "{stdout}");
-    assert!(stdout.contains(" invariant_anchor_safe() (runs: 5, calls: 250, reverts: 0)"));
+    assert!(stdout.contains(" Invariant/Property Tests (runs: 5, calls: 250, reverts: 0)"));
+    assert!(!stdout.contains(" invariant_anchor_safe() (runs:"), "{stdout}");
     assert!(!stdout.contains("[FAIL: safe broken] invariant_anchor_safe"), "{stdout}");
 });
 

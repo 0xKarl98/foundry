@@ -217,7 +217,7 @@ fn record_new_invariant_failures(
 /// single JSON event shape.
 fn build_invariant_progress_json<M: Serialize>(
     timestamp_secs: u64,
-    invariant_name: &str,
+    campaign_name: &str,
     corpus_metrics: &M,
     optimization_best: Option<I256>,
     throughput: InvariantThroughputMetrics,
@@ -236,7 +236,7 @@ fn build_invariant_progress_json<M: Serialize>(
     let mut payload = json!({
         "timestamp": timestamp_secs,
         "event": "pulse",
-        "invariant": invariant_name,
+        "campaign": campaign_name,
         "metrics": metrics,
         "total_txs": throughput.total_txs,
         "total_gas": throughput.total_gas,
@@ -879,7 +879,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 // Display corpus metrics inline as JSON.
                 let metrics = build_invariant_progress_json(
                     SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                    &invariant_contract.anchor().name,
+                    invariant_contract.name,
                     &corpus_manager.metrics,
                     invariant_test.test_data.optimization_best_value,
                     throughput,
@@ -1550,7 +1550,7 @@ mod tests {
 
         let payload = build_invariant_progress_json(
             123,
-            "invariant_balance",
+            "test/BalanceTest.t.sol:BalanceTest",
             &json!({ "corpus_count": 7 }),
             Some(I256::try_from(42).unwrap()),
             throughput,
@@ -1559,7 +1559,8 @@ mod tests {
         );
 
         assert_eq!(payload["timestamp"], json!(123));
-        assert_eq!(payload["invariant"], json!("invariant_balance"));
+        assert_eq!(payload["campaign"], json!("test/BalanceTest.t.sol:BalanceTest"));
+        assert!(payload.get("invariant").is_none());
         assert_eq!(payload["metrics"]["corpus_count"], json!(7));
         assert_eq!(payload["metrics"]["broken_handlers"], json!(0));
         assert_eq!(payload["total_txs"], json!(2));
@@ -1576,7 +1577,7 @@ mod tests {
 
         let payload = build_invariant_progress_json(
             456,
-            "invariant_zero_elapsed",
+            "test/ZeroElapsed.t.sol:ZeroElapsed",
             &json!({ "corpus_count": 1 }),
             None,
             throughput,
@@ -1599,7 +1600,7 @@ mod tests {
 
         let payload = build_invariant_progress_json(
             789,
-            "invariant_a",
+            "test/FailureTest.t.sol:FailureTest",
             &json!({ "corpus_count": 5 }),
             None,
             InvariantThroughputMetrics::default(),

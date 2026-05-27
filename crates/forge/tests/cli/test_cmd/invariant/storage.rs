@@ -87,7 +87,7 @@ Invariant/Property Tests: 4/4 invariants broken
 [FAIL: changedUint] invariantChangeUint
 [FAIL: pushUint] invariantPush
 4 invariant failure(s) persisted to cache/invariant/failures/InvariantStorageTest — rerun to shrink
- invariantChangeAddress() ([RUNS])
+ Invariant/Property Tests ([RUNS])
 
 [STATS]
 
@@ -115,7 +115,7 @@ Invariant/Property Tests: 4/4 invariants broken
 [FAIL: changedUint] invariantChangeUint
 [FAIL: pushUint] invariantPush
 4 invariant failure(s) persisted to cache/invariant/failures/InvariantStorageTest — rerun to shrink
- invariantChangeAddress() ([RUNS])
+ Invariant/Property Tests ([RUNS])
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 

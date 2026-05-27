@@ -7,7 +7,8 @@ use crate::{
     multi_runner::{TestContract, TestRunnerConfig},
     progress::{TestsProgress, start_fuzz_progress},
     result::{
-        InvariantFailure, InvariantPredicateResult, SuiteResult, TestResult, TestSetup, TestStatus,
+        INVARIANT_CAMPAIGN_DISPLAY_NAME, InvariantFailure, InvariantPredicateResult, SuiteResult,
+        TestResult, TestSetup, TestStatus,
     },
 };
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
@@ -1022,11 +1023,16 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             &self.cr.contract.abi,
         );
         let show_solidity = invariant_config.show_solidity;
+        let invariant_campaign_name = if invariant_contract.invariant_fns.len() > 1 {
+            INVARIANT_CAMPAIGN_DISPLAY_NAME.to_string()
+        } else {
+            invariant_contract.anchor().name.clone()
+        };
 
         let progress = start_fuzz_progress(
             self.cr.progress,
             self.cr.name,
-            &invariant_contract.anchor().name,
+            &invariant_campaign_name,
             invariant_config.timeout,
             invariant_config.runs,
         );
@@ -1063,7 +1069,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                         .to_string();
 
                 if let Some(ref progress) = progress {
-                    progress.set_prefix(format!("{}\n{warn}\n", invariant_contract.anchor().name));
+                    progress.set_prefix(format!("{invariant_campaign_name}\n{warn}\n"));
                 } else {
                     let _ = sh_warn!("{warn}");
                 }

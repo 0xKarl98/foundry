@@ -751,7 +751,7 @@ Ran 1 test for test/TargetArtifacts.t.sol:TargetArtifacts
 Invariant/Property Tests: 1/2 invariants broken
 [FAIL: false world] invariantShouldFail
 [PASS] invariantShouldPass
- invariantShouldFail() ([RUNS])
+ Invariant/Property Tests ([RUNS])
 
 [STATS]
 
@@ -767,7 +767,7 @@ Encountered 1 failing test in test/TargetArtifacts.t.sol:TargetArtifacts
 Invariant/Property Tests: 1/2 invariants broken
 [FAIL: false world] invariantShouldFail
 [PASS] invariantShouldPass
- invariantShouldFail() ([RUNS])
+ Invariant/Property Tests ([RUNS])
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 

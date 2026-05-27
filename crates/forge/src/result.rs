@@ -27,6 +27,8 @@ use std::{
 };
 use yansi::Paint;
 
+pub(crate) const INVARIANT_CAMPAIGN_DISPLAY_NAME: &str = "Invariant/Property Tests";
+
 /// The aggregated result of a test run.
 #[derive(Clone, Debug)]
 pub struct TestOutcome {
@@ -434,9 +436,8 @@ pub enum InvariantFailure {
         counterexample: Option<CounterExample>,
         /// Path where the counterexample was persisted for re-running and shrinking.
         persisted_path: std::path::PathBuf,
-        /// Whether this failure is the stable campaign anchor.
-        /// When `true` and this is the only failure, the function name is omitted on the
-        /// `[FAIL: ...]` line (the trailing summary already identifies it).
+        /// Whether this failure is the stable campaign anchor. Anchor failures keep the compact
+        /// render by omitting the function name on the primary `[FAIL: ...]` line.
         #[serde(default)]
         is_anchor: bool,
     },
@@ -663,7 +664,7 @@ impl TestResult {
                 } else if !self.invariant_failures.is_empty() {
                     // Render every broken invariant uniformly. Show the function name on the
                     // `[FAIL: ...]` line when there is >1 failure or the failure isn't the
-                    // anchor (the anchor's name is already on the trailing summary).
+                    // anchor.
                     let multi = self.invariant_failures.len() > 1;
                     for (i, failure) in self.invariant_failures.iter().enumerate() {
                         if i > 0 {
@@ -1137,7 +1138,20 @@ impl TestResult {
                 })
                 .join("\n");
         }
+        let name = self.short_result_name(name);
         format!("{} {name} {}", self.render_status_block(true), self.kind.report())
+    }
+
+    fn short_result_name<'a>(&self, name: &'a str) -> &'a str {
+        if self.uses_invariant_campaign_display_name() {
+            INVARIANT_CAMPAIGN_DISPLAY_NAME
+        } else {
+            name
+        }
+    }
+
+    fn uses_invariant_campaign_display_name(&self) -> bool {
+        self.kind.is_invariant() && self.invariant_count.is_some()
     }
 
     fn logical_count(&self) -> usize {
@@ -1367,6 +1381,48 @@ impl TestKind {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invariant_result(runs: usize, calls: usize) -> TestResult {
+        let mut result = TestResult::default();
+        result.kind = TestKind::Invariant {
+            runs,
+            calls,
+            reverts: 0,
+            metrics: HashMap::default(),
+            failed_corpus_replays: 0,
+            optimization_best_value: None,
+        };
+        result
+    }
+
+    #[test]
+    fn short_result_uses_campaign_name_for_multi_predicate_invariants() {
+        let mut result = invariant_result(5, 250);
+        result.status = TestStatus::Success;
+        result.invariant_count = Some(2);
+        result.invariant_predicate_results = vec![
+            InvariantPredicateResult {
+                name: "invariant_anchor_safe".to_string(),
+                status: TestStatus::Success,
+                reason: None,
+            },
+            InvariantPredicateResult {
+                name: "invariant_secondary_breakable".to_string(),
+                status: TestStatus::Success,
+                reason: None,
+            },
+        ];
+
+        let rendered = result.short_result("invariant_anchor_safe()");
+
+        assert!(rendered.contains("Invariant/Property Tests (runs: 5, calls: 250, reverts: 0)"));
+        assert!(!rendered.contains("invariant_anchor_safe() (runs:"));
     }
 }
 
