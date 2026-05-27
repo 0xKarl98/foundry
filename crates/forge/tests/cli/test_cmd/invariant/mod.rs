@@ -1252,7 +1252,6 @@ contract JsonInvariantReportTest is Test {
     let result = tests.values().next().unwrap();
     let failures = result["invariant_failures"].as_array().unwrap();
     assert_eq!(failures.len(), 1);
-    assert!(failures[0].get("is_anchor").is_none());
 
     let predicates = result["invariant_predicate_results"].as_array().unwrap();
     assert_eq!(predicates.len(), 2);
@@ -2158,8 +2157,8 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 });
 
 // Verifies the persisted-primary replay fast path keeps the campaign-level output label instead
-// of falling back to the primary invariant anchor name.
-forgetest_init!(persisted_anchor_replay_uses_campaign_label, |prj, cmd| {
+// of falling back to the selected predicate name.
+forgetest_init!(persisted_primary_replay_uses_campaign_label, |prj, cmd| {
     prj.update_config(|config| {
         config.invariant.runs = 5;
         config.invariant.depth = 50;
@@ -2177,12 +2176,12 @@ contract Counter {
    "#,
     );
     prj.add_test(
-        "PersistedAnchorReplayTest.t.sol",
+        "PersistedPrimaryReplayTest.t.sol",
         r#"
 import {Test} from "forge-std/Test.sol";
 import {Counter} from "../src/Counter.sol";
 
-contract PersistedAnchorReplayTest is Test {
+contract PersistedPrimaryReplayTest is Test {
     Counter public counter;
 
     function setUp() public {
@@ -2190,8 +2189,8 @@ contract PersistedAnchorReplayTest is Test {
         targetContract(address(counter));
     }
 
-    function invariant_anchor_breakable() public view {
-        require(counter.cond() < 2, "anchor broken");
+    function invariant_primary_breakable() public view {
+        require(counter.cond() < 2, "primary broken");
     }
 
     function invariant_secondary_safe() public view {
@@ -2201,20 +2200,27 @@ contract PersistedAnchorReplayTest is Test {
    "#,
     );
 
-    cmd.args(["test", "--mt", "invariant_"]).assert_failure();
+    let first = cmd.args(["test", "--mt", "invariant_"]).assert_failure();
+    let first_stdout = String::from_utf8_lossy(&first.get_output().stdout);
+    assert!(
+        first_stdout.contains("[FAIL: primary broken] invariant_primary_breakable"),
+        "{first_stdout}"
+    );
+    assert!(first_stdout.contains(" Invariant/Property Tests (runs:"), "{first_stdout}");
+    assert!(!first_stdout.contains(" invariant_primary_breakable() (runs:"), "{first_stdout}");
 
     let output = cmd.forge_fuse().args(["test", "--mt", "invariant_"]).assert_failure();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     assert!(stderr.contains("Replayed invariant failure from persisted file."), "{stderr}");
-    assert!(stdout.contains("[FAIL: anchor broken]"), "{stdout}");
+    assert!(stdout.contains("[FAIL: primary broken]"), "{stdout}");
     assert!(stdout.contains(" Invariant/Property Tests (runs:"), "{stdout}");
-    assert!(!stdout.contains(" invariant_anchor_breakable() (runs:"), "{stdout}");
+    assert!(!stdout.contains(" invariant_primary_breakable() (runs:"), "{stdout}");
 });
 
-// Verifies that when the campaign anchor passes but another selected predicate fails, the report
-// doesn't render a hollow `[FAIL]` header for the primary and the suite roll-up counts only the
-// actually-broken invariants.
+// Verifies that when the selected primary predicate passes but another selected predicate fails,
+// the report doesn't render a hollow `[FAIL]` header for the primary and the suite roll-up counts
+// only the actually-broken invariants.
 forgetest_init!(secondary_only_failure_no_hollow_fail, |prj, cmd| {
     prj.update_config(|config| {
         config.invariant.runs = 5;
@@ -2246,8 +2252,8 @@ contract SecondaryOnlyTest is Test {
         targetContract(address(counter));
     }
 
-    // Campaign anchor; never breaks.
-    function invariant_anchor_safe() public view {
+    // Selected primary predicate; never breaks.
+    function invariant_primary_safe() public view {
         require(counter.cond() < 1000000, "safe broken");
     }
 
@@ -2263,16 +2269,16 @@ contract SecondaryOnlyTest is Test {
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
     assert!(stdout.contains("[FAIL: breakable broken] invariant_secondary_breakable"), "{stdout}");
     assert!(stdout.contains("Invariant/Property Tests: 1/2 invariants broken"), "{stdout}");
-    assert!(stdout.contains("[PASS] invariant_anchor_safe"), "{stdout}");
+    assert!(stdout.contains("[PASS] invariant_primary_safe"), "{stdout}");
     assert!(stdout.contains(" Invariant/Property Tests (runs: 5, calls: 250, reverts: 0)"));
-    assert!(!stdout.contains(" invariant_anchor_safe() (runs:"), "{stdout}");
-    assert!(!stdout.contains("[FAIL: safe broken] invariant_anchor_safe"), "{stdout}");
+    assert!(!stdout.contains(" invariant_primary_safe() (runs:"), "{stdout}");
+    assert!(!stdout.contains("[FAIL: safe broken] invariant_primary_safe"), "{stdout}");
 });
 
 // Verifies `forge test --rerun` records the predicate that actually failed inside a merged
-// campaign, not just the campaign anchor. Otherwise a secondary-only failure would be rerun as
-// the passing anchor and incorrectly succeed.
-forgetest_init!(rerun_replays_non_anchor_invariant_failure, |prj, cmd| {
+// campaign, not just the selected primary predicate. Otherwise a secondary-only failure would be
+// rerun as the passing primary predicate and incorrectly succeed.
+forgetest_init!(rerun_replays_secondary_invariant_failure, |prj, cmd| {
     prj.update_config(|config| {
         config.invariant.runs = 5;
         config.invariant.depth = 50;
@@ -2303,7 +2309,7 @@ contract RerunSecondaryOnlyTest is Test {
         targetContract(address(counter));
     }
 
-    function invariant_anchor_safe() public view {
+    function invariant_primary_safe() public view {
         require(counter.cond() < 1000000, "safe broken");
     }
 
@@ -2318,13 +2324,13 @@ contract RerunSecondaryOnlyTest is Test {
 
     let test_failures = std::fs::read_to_string(prj.root().join("cache/test-failures")).unwrap();
     assert!(test_failures.contains("invariant_secondary_breakable"), "{test_failures}");
-    assert!(!test_failures.contains("invariant_anchor_safe"), "{test_failures}");
+    assert!(!test_failures.contains("invariant_primary_safe"), "{test_failures}");
 
     let output = cmd.forge_fuse().args(["test", "--rerun"]).assert_failure();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
     assert!(stdout.contains("[FAIL: breakable broken]"), "{stdout}");
     assert!(stdout.contains(" invariant_secondary_breakable() (runs:"), "{stdout}");
-    assert!(!stdout.contains("invariant_anchor_safe"), "{stdout}");
+    assert!(!stdout.contains("invariant_primary_safe"), "{stdout}");
 });
 
 // Verifies the structured JSON failure event emitted at campaign end attributes the broken

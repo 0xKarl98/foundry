@@ -1026,16 +1026,16 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         let logical_invariant_count =
             invariant_contract.invariant_fns.len() + skipped_predicate_results.len();
         let invariant_count = (logical_invariant_count > 1).then_some(logical_invariant_count);
-        let invariant_campaign_name = if invariant_count.is_some() {
+        let invariant_display_name = if invariant_count.is_some() {
             INVARIANT_CAMPAIGN_DISPLAY_NAME
         } else {
-            invariant_contract.anchor().name.as_str()
+            func.name.as_str()
         };
 
         let progress = start_fuzz_progress(
             self.cr.progress,
             self.cr.name,
-            invariant_campaign_name,
+            invariant_display_name,
             invariant_config.timeout,
             invariant_config.runs,
         );
@@ -1070,7 +1070,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 let warn = "Replayed invariant failure from persisted file. \nRun `forge clean` or remove file to ignore failure and to continue invariant test campaign.";
 
                 if let Some(ref progress) = progress {
-                    progress.set_prefix(format!("{invariant_campaign_name}\n{warn}\n"));
+                    progress.set_prefix(format!("{invariant_display_name}\n{warn}\n"));
                 } else {
                     let _ = sh_warn!("{warn}");
                 }
@@ -1115,7 +1115,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
 
                 self.result.invariant_replay_fail(
                     replayed_entirely,
-                    invariant_campaign_name,
+                    invariant_display_name,
                     replay_reason,
                     call_sequence,
                     invariant_count,
@@ -1270,7 +1270,6 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                     reason: error.revert_reason().unwrap_or_default(),
                     counterexample: anchor_counterexample,
                     persisted_path: primary_failure_file,
-                    is_anchor: true,
                 });
             }
 
@@ -1372,7 +1371,6 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                         reason: error.revert_reason().unwrap_or_default(),
                         counterexample: secondary_counterexample,
                         persisted_path: persisted_failure.clone(),
-                        is_anchor: false,
                     });
                 }
             }

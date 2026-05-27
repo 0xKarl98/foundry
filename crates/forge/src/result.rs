@@ -436,10 +436,6 @@ pub enum InvariantFailure {
         counterexample: Option<CounterExample>,
         /// Path where the counterexample was persisted for re-running and shrinking.
         persisted_path: std::path::PathBuf,
-        /// Whether this failure is the stable campaign anchor. This is an internal rendering hint
-        /// and is not part of the user-facing JSON output.
-        #[serde(default, skip_serializing)]
-        is_anchor: bool,
     },
     /// A handler-side assertion bug discovered during the campaign.
     Handler {
@@ -662,20 +658,19 @@ impl TestResult {
                         s.push(']');
                     }
                 } else if !self.invariant_failures.is_empty() {
-                    // Render every broken invariant uniformly. Show the function name on the
-                    // `[FAIL: ...]` line when there is >1 failure or the failure isn't the
-                    // anchor.
+                    // Contract-level campaigns must identify the broken predicate even when only
+                    // one predicate failed. Preserve the old omitted-name shape only for
+                    // single-predicate invariant tests.
                     let multi = self.invariant_failures.len() > 1;
                     for (i, failure) in self.invariant_failures.iter().enumerate() {
                         if i > 0 {
                             s.push('\n');
                         }
-                        let is_anchor =
-                            matches!(failure, InvariantFailure::Predicate { is_anchor: true, .. });
-                        let name_suffix = if multi || !is_anchor {
-                            format!(" {}", failure.name())
-                        } else {
+                        let legacy_single_predicate = self.invariant_count.is_none() && !multi;
+                        let name_suffix = if legacy_single_predicate {
                             String::new()
+                        } else {
+                            format!(" {}", failure.name())
                         };
                         if let Some(CounterExample::Sequence(original, sequence)) =
                             failure.counterexample()
@@ -1402,7 +1397,7 @@ mod tests {
         result.invariant_count = Some(2);
         result.invariant_predicate_results = vec![
             InvariantPredicateResult {
-                name: "invariant_anchor_safe".to_string(),
+                name: "invariant_primary_safe".to_string(),
                 status: TestStatus::Success,
                 reason: None,
             },
@@ -1413,10 +1408,42 @@ mod tests {
             },
         ];
 
-        let rendered = result.short_result("invariant_anchor_safe()");
+        let rendered = result.short_result("invariant_primary_safe()");
 
         assert!(rendered.contains("Invariant/Property Tests (runs: 5, calls: 250, reverts: 0)"));
-        assert!(!rendered.contains("invariant_anchor_safe() (runs:"));
+        assert!(!rendered.contains("invariant_primary_safe() (runs:"));
+    }
+
+    #[test]
+    fn multi_predicate_primary_failure_keeps_predicate_name_in_failure_block() {
+        let mut result = invariant_result(1, 3);
+        result.status = TestStatus::Failure;
+        result.invariant_count = Some(2);
+        result.invariant_failures = vec![InvariantFailure::Predicate {
+            name: "invariant_primary_breakable".to_string(),
+            reason: "primary broken".to_string(),
+            counterexample: None,
+            persisted_path: std::path::PathBuf::new(),
+        }];
+        result.invariant_predicate_results = vec![
+            InvariantPredicateResult {
+                name: "invariant_primary_breakable".to_string(),
+                status: TestStatus::Failure,
+                reason: Some("primary broken".to_string()),
+            },
+            InvariantPredicateResult {
+                name: "invariant_secondary_safe".to_string(),
+                status: TestStatus::Success,
+                reason: None,
+            },
+        ];
+
+        let rendered = result.short_result("invariant_primary_breakable()");
+
+        assert!(rendered.contains("[FAIL: primary broken] invariant_primary_breakable"));
+        assert!(rendered.contains("Invariant/Property Tests: 1/2 invariants broken"));
+        assert!(rendered.contains("Invariant/Property Tests (runs: 1, calls: 3, reverts: 0)"));
+        assert!(!rendered.contains("invariant_primary_breakable() (runs:"));
     }
 }
 
