@@ -220,26 +220,25 @@ async fn run_for_command(
     let child_result = run_inner_command(&for_command, session_id);
     let revoke_result = run_revoke(session_id, false, tx, send_tx).await;
 
-    match (child_result, revoke_result) {
-        (Ok(status), Ok(())) if status.success() => Ok(()),
-        (Ok(status), Ok(())) => Err(inner_command_status_error(&for_command, status)),
-        (Err(child_err), Ok(())) => Err(child_err),
-        (Ok(status), Err(revoke_err)) if status.success() => {
+    let revoke_err = match revoke_result {
+        Ok(()) => None,
+        Err(err) => {
             mark_session_failed(session_id);
+            Some(err)
+        }
+    };
+
+    match (child_result, revoke_err) {
+        (Ok(status), None) if status.success() => Ok(()),
+        (Ok(status), None) => Err(inner_command_status_error(&for_command, status)),
+        (Err(child_err), None) => Err(child_err),
+        (Ok(status), Some(revoke_err)) if status.success() => {
             Err(revoke_err.wrap_err("failed to revoke Tempo session after inner command"))
         }
-        (Ok(status), Err(revoke_err)) => {
-            mark_session_failed(session_id);
-            Err(inner_command_status_error(&for_command, status).wrap_err(format!(
-                "also failed to revoke Tempo session {session_id:?}: {revoke_err}"
-            )))
-        }
-        (Err(child_err), Err(revoke_err)) => {
-            mark_session_failed(session_id);
-            Err(child_err.wrap_err(format!(
-                "also failed to revoke Tempo session {session_id:?}: {revoke_err}"
-            )))
-        }
+        (Ok(status), Some(revoke_err)) => Err(inner_command_status_error(&for_command, status)
+            .wrap_err(format!("also failed to revoke Tempo session {session_id:?}: {revoke_err}"))),
+        (Err(child_err), Some(revoke_err)) => Err(child_err
+            .wrap_err(format!("also failed to revoke Tempo session {session_id:?}: {revoke_err}"))),
     }
 }
 
@@ -517,10 +516,7 @@ async fn handle_revoke_error(
         .unwrap_or(false)
     {
         let _ = update_session_status(session_id, SessionStatus::Revoked);
-    } else if !matches!(
-        read_session_entry(session_id).ok().flatten().map(|entry| entry.status),
-        Some(SessionStatus::Revoked)
-    ) {
+    } else {
         let _ =
             update_session_status_if(session_id, SessionStatus::Revoking, SessionStatus::Failed);
     }
@@ -662,11 +658,7 @@ fn parse_scope(s: &str) -> Result<CallScope, String> {
 
 /// Parses a session spend limit into the session policy model.
 fn parse_spend_limit(s: &str) -> Result<SessionSpendLimit, String> {
-    let (token_str, amount_str) = if let Some(pair) = s.split_once(':') {
-        pair
-    } else if let Some(pair) = s.split_once('=') {
-        pair
-    } else {
+    let Some((token_str, amount_str)) = s.split_once(':').or_else(|| s.split_once('=')) else {
         return Err(format!("invalid limit format: {s} (expected TOKEN:AMOUNT or TOKEN=AMOUNT)"));
     };
 
