@@ -64,6 +64,8 @@ fn create_session(cmd: &mut TestCommand, tempo_home: &Path, chain_id: &str) -> (
 
     let created: serde_json::Value =
         serde_json::from_str(create_output.trim()).expect("session create emits JSON");
+    assert_eq!(created["provisioning"], "inline");
+    assert_eq!(created["provisioned"], false);
     let session_id = created["session_id"].as_str().expect("session_id").to_string();
     let key_address = created["key_address"].as_str().expect("key_address").to_string();
     (session_id, key_address)
@@ -109,6 +111,10 @@ fn assert_session_cleanup_failure(stderr: &str) {
     );
     assert!(
         stderr.contains("session key is not provisioned on-chain yet"),
+        "unexpected stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("first session transaction may still inline-provision it"),
         "unexpected stderr:\n{stderr}"
     );
 }

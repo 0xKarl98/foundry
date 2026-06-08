@@ -56,6 +56,7 @@ const SESSION_CHILD_SIGNER_ENV: &[&str] = &[
 /// Arguments for `cast wallet session`.
 ///
 /// Without a subcommand, this runs an issue-style temporary session around `--for <COMMAND>`.
+/// The session key is provisioned inline by the first Tempo transaction that uses it.
 /// The existing `create` and `revoke` subcommands remain explicit lifecycle operations.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -87,7 +88,8 @@ pub struct SessionArgs {
     #[arg(long = "spend-limit", value_parser = parse_spend_limit)]
     pub spend_limits: Vec<SessionSpendLimit>,
 
-    /// Command to run with the temporary Tempo session.
+    /// Command to run with the temporary Tempo session. The first session transaction provisions
+    /// the key inline.
     #[arg(long = "for", value_name = "COMMAND")]
     pub for_command: Option<String>,
 
@@ -150,7 +152,7 @@ impl SessionArgs {
 /// Tempo wallet session lifecycle commands.
 #[derive(Debug, Parser)]
 pub enum SessionSubcommands {
-    /// Create a temporary Tempo session and persist it locally.
+    /// Create a temporary Tempo session and persist it locally for inline provisioning.
     Create {
         /// Root account that will authorize the session.
         #[arg(long = "root", value_name = "ADDRESS")]
@@ -501,7 +503,7 @@ fn split_for_command(command: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
-/// Creates a signed session entry and stores it in the local registry.
+/// Creates a signed session entry and stores it in the local registry for inline provisioning.
 async fn run_create(
     root_account: Address,
     chain_id: u64,
@@ -531,6 +533,8 @@ async fn run_create(
                 "key_address": key_address.to_string(),
                 "expiry": expiry,
                 "status": "active",
+                "provisioning": "inline",
+                "provisioned": false,
                 "scope_count": scope_count,
                 "spend_limit_count": spend_limit_count,
             }))?
@@ -541,6 +545,7 @@ async fn run_create(
         sh_println!("Chain: {}", chain_id)?;
         sh_println!("Key:   {}", key_address)?;
         sh_println!("Expiry: {}", expiry)?;
+        sh_println!("Provisioning: inline on first session transaction")?;
     }
 
     Ok(())
@@ -649,9 +654,9 @@ fn handle_unprovisioned_revoke(
         }
         UnprovisionedKeyPolicy::Fail => {
             eyre::bail!(
-                "session key is not provisioned on-chain yet; pending transactions from the \
-                 wrapped command may still provision it. Wait for pending transactions to settle, \
-                 then run `cast wallet session revoke {session_id}`."
+                "session key is not provisioned on-chain yet; the first session transaction may \
+                 still inline-provision it. Wait for that transaction to settle, then run `cast \
+                 wallet session revoke {session_id}`."
             )
         }
     }
