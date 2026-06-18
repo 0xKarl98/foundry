@@ -1032,6 +1032,8 @@ pub struct RawCallResult<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     pub evm_cmp_values: Option<Vec<CmpOperands>>,
     /// Observed sub-calls collected during the call.
     pub observed_calls: Vec<ObservedCall>,
+    /// Observed sub-calls dropped because the inspector buffer was full.
+    pub observed_calls_dropped: usize,
     /// Sancov edge coverage from instrumented native Rust crates (e.g. precompiles).
     /// Tracked separately from EVM edge coverage to avoid ID-space collisions.
     pub sancov_coverage: Option<Vec<u8>>,
@@ -1072,6 +1074,7 @@ impl<FEN: FoundryEvmNetwork> Default for RawCallResult<FEN> {
             edge_coverage: None,
             evm_cmp_values: None,
             observed_calls: Vec::new(),
+            observed_calls_dropped: 0,
             sancov_coverage: None,
             sancov_cmp_values: None,
             transactions: None,
@@ -1317,12 +1320,14 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
         Some(Output::Call(data)) => data.clone(),
         _ => Bytes::new(),
     };
-    let observed_calls = inspector
+    let observed = inspector
         .inner
         .fuzzer
         .as_mut()
         .map(|fuzzer| fuzzer.take_observed_calls())
         .unwrap_or_default();
+    let observed_calls = observed.calls;
+    let observed_calls_dropped = observed.dropped;
 
     let InspectorData {
         mut logs,
@@ -1362,6 +1367,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
         edge_coverage,
         evm_cmp_values,
         observed_calls,
+        observed_calls_dropped,
         sancov_coverage: None,
         sancov_cmp_values: None,
         transactions,

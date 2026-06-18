@@ -8,6 +8,8 @@ use revm::{
     interpreter::{CallInput, CallInputs, CallOutcome, CallScheme, CallValue, Interpreter},
 };
 
+const MAX_OBSERVED_CALLS: usize = 1024;
+
 /// A sub-call observed by the [`Fuzzer`] inspector.
 ///
 /// `depth` is 1-indexed relative to the top-level call: depth 1 is a direct call
@@ -20,6 +22,12 @@ pub struct ObservedCall {
     pub target: Address,
     pub calldata: Bytes,
     pub value: Option<U256>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedCalls {
+    pub calls: Vec<ObservedCall>,
+    pub dropped: usize,
 }
 
 /// An inspector that can fuzz and collect data for that effect.
@@ -39,6 +47,8 @@ pub struct Fuzzer {
     record_calls: bool,
     /// Sub-calls observed since the last drain.
     observed_calls: Vec<ObservedCall>,
+    /// Number of sub-calls dropped because the buffer reached its cap.
+    observed_calls_dropped: usize,
     /// Current EVM call depth. 0 means no active call, 1 means top-level call.
     call_depth: u32,
 }
@@ -107,6 +117,7 @@ impl Fuzzer {
             mapping_slots,
             record_calls: false,
             observed_calls: Vec::new(),
+            observed_calls_dropped: 0,
             call_depth: 0,
         }
     }
@@ -123,8 +134,11 @@ impl Fuzzer {
     }
 
     /// Returns the buffered sub-calls observed since the last drain.
-    pub fn take_observed_calls(&mut self) -> Vec<ObservedCall> {
-        std::mem::take(&mut self.observed_calls)
+    pub fn take_observed_calls(&mut self) -> ObservedCalls {
+        ObservedCalls {
+            calls: std::mem::take(&mut self.observed_calls),
+            dropped: std::mem::take(&mut self.observed_calls_dropped),
+        }
     }
 
     fn record_observed_call(
@@ -136,13 +150,17 @@ impl Fuzzer {
         scheme: CallScheme,
     ) {
         if self.record_calls && self.call_depth > 1 && matches!(scheme, CallScheme::Call) {
-            self.observed_calls.push(ObservedCall {
-                depth: self.call_depth - 1,
-                caller,
-                target,
-                calldata,
-                value,
-            });
+            if self.observed_calls.len() < MAX_OBSERVED_CALLS {
+                self.observed_calls.push(ObservedCall {
+                    depth: self.call_depth - 1,
+                    caller,
+                    target,
+                    calldata,
+                    value,
+                });
+            } else {
+                self.observed_calls_dropped += 1;
+            }
         }
     }
 
@@ -264,7 +282,7 @@ mod tests {
             CallScheme::Call,
         );
 
-        assert!(fuzzer.take_observed_calls().is_empty());
+        assert!(fuzzer.take_observed_calls().calls.is_empty());
     }
 
     #[test]
@@ -280,7 +298,7 @@ mod tests {
             CallScheme::Call,
         );
 
-        assert!(fuzzer.take_observed_calls().is_empty());
+        assert!(fuzzer.take_observed_calls().calls.is_empty());
     }
 
     #[test]
@@ -295,7 +313,7 @@ mod tests {
         fuzzer.record_observed_call(caller, target, calldata.clone(), value, CallScheme::Call);
 
         assert_eq!(
-            fuzzer.take_observed_calls(),
+            fuzzer.take_observed_calls().calls,
             vec![ObservedCall { depth: 2, caller, target, calldata, value }]
         );
     }
@@ -313,7 +331,7 @@ mod tests {
             CallScheme::DelegateCall,
         );
 
-        assert!(fuzzer.take_observed_calls().is_empty());
+        assert!(fuzzer.take_observed_calls().calls.is_empty());
     }
 
     #[test]
@@ -328,7 +346,27 @@ mod tests {
             CallScheme::Call,
         );
 
-        assert_eq!(fuzzer.take_observed_calls().len(), 1);
-        assert!(fuzzer.take_observed_calls().is_empty());
+        assert_eq!(fuzzer.take_observed_calls().calls.len(), 1);
+        assert!(fuzzer.take_observed_calls().calls.is_empty());
+    }
+
+    #[test]
+    fn observed_calls_are_capped() {
+        let mut fuzzer = fuzzer(true);
+        fuzzer.call_depth = 2;
+
+        for _ in 0..MAX_OBSERVED_CALLS + 1 {
+            fuzzer.record_observed_call(
+                Address::from([0xaa; 20]),
+                Address::from([0x33; 20]),
+                Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+                None,
+                CallScheme::Call,
+            );
+        }
+
+        let observed = fuzzer.take_observed_calls();
+        assert_eq!(observed.calls.len(), MAX_OBSERVED_CALLS);
+        assert_eq!(observed.dropped, 1);
     }
 }

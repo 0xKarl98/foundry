@@ -921,11 +921,14 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     current_run.new_coverage = true;
                 }
                 let observed_calls = std::mem::take(&mut call_result.observed_calls);
+                let observed_calls_dropped = call_result.observed_calls_dropped;
                 if new_call_coverage
                     && let Some(entry) = corpus_manager.hoist_observed_calls(
                         &observed_calls,
+                        observed_calls_dropped,
                         current_run.inputs.last().expect("checked above"),
                         &invariant_test.targeted_contracts,
+                        &campaign_seed.sender_filters,
                         if corpus_persistence.is_deferred() {
                             CorpusInsertionMode::Deferred
                         } else {
@@ -1431,9 +1434,12 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             corpus_seed,
         );
 
-        if let Err(err) =
-            worker.seed_from_test_traces(invariant_contract, &targeted_contracts, executor)
-        {
+        if let Err(err) = worker.seed_from_test_traces(
+            invariant_contract,
+            &targeted_contracts,
+            &campaign_seed.sender_filters,
+            executor,
+        ) {
             debug!(target: "corpus", %err, "failed to seed corpus from test traces");
         }
 

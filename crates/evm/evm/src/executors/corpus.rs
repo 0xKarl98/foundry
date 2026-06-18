@@ -41,7 +41,7 @@ use crate::{
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
-use alloy_primitives::{Address, Bytes, I256, U256};
+use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use eyre::{Result, eyre};
 use foundry_common::{ContractsByAddress, ContractsByArtifact, TestFunctionExt, sh_warn};
 use foundry_config::FuzzCorpusConfig;
@@ -49,7 +49,8 @@ use foundry_evm_core::{constants::CALLER, evm::FoundryEvmNetwork, utils::StateCh
 use foundry_evm_fuzz::{
     BasicTxDetails, CallDetails, ObservedCall,
     invariant::{
-        ArtifactFilters, FuzzRunIdentifiedContracts, InvariantContract, TargetedContracts,
+        ArtifactFilters, FuzzRunIdentifiedContracts, InvariantContract, SenderFilters,
+        TargetedContracts,
     },
     strategies::{
         EvmFuzzState, FuzzStateReader, InvariantFuzzState, generate_msg_value, mutate_param_value,
@@ -84,6 +85,9 @@ const FAVORABILITY_THRESHOLD: f64 = 0.3;
 /// Threshold for compressing corpus entries.
 /// 4KiB is usually the minimum file size on popular file systems.
 const GZIP_THRESHOLD: usize = 4 * 1024;
+
+const MAX_HOISTED_SEQUENCE_LEN: usize = 128;
+const MAX_HOISTED_CALLDATA_LEN: usize = 16 * 1024;
 
 /// Possible mutation strategies to apply on a call sequence.
 #[derive(Debug, Clone)]
@@ -191,6 +195,7 @@ impl CorpusEntry {
 pub(crate) struct CampaignCorpusEntry {
     tx_seq: Vec<BasicTxDetails>,
     dedupe_by_coverage: bool,
+    hoisted_fingerprint: Option<B256>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,9 +370,8 @@ impl WorkerCorpusSeed {
         let mut history_map = self.history_map.clone();
         let mut edge_indices = self.edge_indices.clone();
         let mut sancov_history_map = self.sancov_history_map.clone();
-
         let mut output_dir_ready = false;
-        for entry in entries {
+        for entry in dedupe_hoisted_entries(entries) {
             if entry.dedupe_by_coverage {
                 let coverage = ReplayCoverage {
                     history_map: &mut history_map,
@@ -419,6 +423,11 @@ impl GlobalCorpusMetrics {
             cumulative_features_seen: self.cumulative_features_seen.load(Ordering::Relaxed),
             corpus_count: self.corpus_count.load(Ordering::Relaxed),
             favored_items: self.favored_items.load(Ordering::Relaxed),
+            hoisted_inserted: 0,
+            hoisted_skipped_sender: 0,
+            hoisted_skipped_replay: 0,
+            hoisted_skipped_limits: 0,
+            hoisted_skipped_duplicate: 0,
         }
     }
 }
@@ -433,6 +442,25 @@ pub(crate) struct CorpusMetrics {
     corpus_count: usize,
     // Number of corpus entries that are favored.
     favored_items: usize,
+    // Number of trace-derived corpus entries inserted.
+    #[serde(skip_serializing_if = "is_zero")]
+    hoisted_inserted: usize,
+    // Number of trace-derived calls skipped by sender filters.
+    #[serde(skip_serializing_if = "is_zero")]
+    hoisted_skipped_sender: usize,
+    // Number of trace-derived calls skipped by target/selector filters.
+    #[serde(skip_serializing_if = "is_zero")]
+    hoisted_skipped_replay: usize,
+    // Number of trace-derived calls skipped by calldata or sequence limits.
+    #[serde(skip_serializing_if = "is_zero")]
+    hoisted_skipped_limits: usize,
+    // Number of trace-derived sequences skipped because they were already seen.
+    #[serde(skip_serializing_if = "is_zero")]
+    hoisted_skipped_duplicate: usize,
+}
+
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl fmt::Display for CorpusMetrics {
@@ -443,6 +471,23 @@ impl fmt::Display for CorpusMetrics {
         writeln!(f, "        - cumulative features seen: {}", self.cumulative_features_seen)?;
         writeln!(f, "        - corpus count: {}", self.corpus_count)?;
         write!(f, "        - favored items: {}", self.favored_items)?;
+        if self.hoisted_inserted
+            + self.hoisted_skipped_sender
+            + self.hoisted_skipped_replay
+            + self.hoisted_skipped_limits
+            + self.hoisted_skipped_duplicate
+            > 0
+        {
+            write!(
+                f,
+                "\n        - hoisted: inserted {}, skipped sender {}, replay {}, limits {}, duplicate {}",
+                self.hoisted_inserted,
+                self.hoisted_skipped_sender,
+                self.hoisted_skipped_replay,
+                self.hoisted_skipped_limits,
+                self.hoisted_skipped_duplicate
+            )?;
+        }
         Ok(())
     }
 }
@@ -505,6 +550,8 @@ pub struct WorkerCorpus {
     optimization_best_value: Option<I256>,
     /// Optimization mode: the call sequence that produced the best value.
     optimization_best_sequence: Vec<BasicTxDetails>,
+    /// Fingerprints of trace-derived sequences inserted by this worker.
+    hoisted_fingerprints: HashSet<B256>,
 }
 
 /// Refs used during corpus replay to register contracts deployed mid-sequence as fuzz targets,
@@ -733,6 +780,7 @@ impl WorkerCorpus {
             last_sync_metrics: Default::default(),
             optimization_best_value: seed.optimization_best_value,
             optimization_best_sequence: seed.optimization_best_sequence,
+            hoisted_fingerprints: HashSet::new(),
         }
     }
 
@@ -837,6 +885,7 @@ impl WorkerCorpus {
             corpus,
             if persist_now { CorpusInsertionMode::Live } else { CorpusInsertionMode::Deferred },
             new_coverage,
+            None,
         )
     }
 
@@ -845,9 +894,14 @@ impl WorkerCorpus {
         corpus: CorpusEntry,
         insertion_mode: CorpusInsertionMode,
         dedupe_by_coverage: bool,
+        hoisted_fingerprint: Option<B256>,
     ) -> Option<CampaignCorpusEntry> {
-        let campaign_entry = matches!(insertion_mode, CorpusInsertionMode::Deferred)
-            .then(|| CampaignCorpusEntry { tx_seq: corpus.tx_seq.clone(), dedupe_by_coverage });
+        let campaign_entry =
+            matches!(insertion_mode, CorpusInsertionMode::Deferred).then(|| CampaignCorpusEntry {
+                tx_seq: corpus.tx_seq.clone(),
+                dedupe_by_coverage,
+                hoisted_fingerprint,
+            });
 
         if matches!(insertion_mode, CorpusInsertionMode::Live)
             && let Some(worker_dir) = &self.worker_dir
@@ -897,7 +951,7 @@ impl WorkerCorpus {
         optimization_best: Option<(I256, &[BasicTxDetails])>,
     ) {
         let mut output_dir_ready = false;
-        for entry in entries {
+        for entry in dedupe_hoisted_entries(entries) {
             if !output_dir_ready {
                 prepare_campaign_output_dir(config);
                 output_dir_ready = true;
@@ -1153,25 +1207,30 @@ impl WorkerCorpus {
     pub fn hoist_observed_calls(
         &mut self,
         observed: &[ObservedCall],
+        observed_dropped: usize,
         parent_tx: &BasicTxDetails,
         targeted_contracts: &FuzzRunIdentifiedContracts,
+        sender_filters: &SenderFilters,
         insertion_mode: CorpusInsertionMode,
     ) -> Option<CampaignCorpusEntry> {
         if !self.config.is_coverage_guided() || observed.is_empty() {
             return None;
         }
 
-        let tx_seq = {
+        let observed = {
             let targets = targeted_contracts.targets();
             sequence_from_observed(
                 observed,
                 &targets,
+                sender_filters,
                 ObservedCallDepth::All,
                 Some((parent_tx.warp, parent_tx.roll)),
             )
         };
 
-        self.push_observed_sequence(tx_seq, insertion_mode)
+        self.record_observed_sequence_stats(observed.stats);
+        self.metrics.hoisted_skipped_limits += observed_dropped;
+        self.push_observed_sequence(observed.tx_seq, insertion_mode)
     }
 
     /// Seeds the corpus from sibling zero-input unit tests by replaying them on a clone of the
@@ -1182,6 +1241,7 @@ impl WorkerCorpus {
         &mut self,
         invariant_contract: &InvariantContract<'_>,
         targeted_contracts: &FuzzRunIdentifiedContracts,
+        sender_filters: &SenderFilters,
         executor: &Executor<FEN>,
     ) -> Result<usize> {
         if !self.config.is_coverage_guided() {
@@ -1219,13 +1279,20 @@ impl WorkerCorpus {
             }
 
             let observed = raw.observed_calls;
+            self.metrics.hoisted_skipped_limits += raw.observed_calls_dropped;
             if observed.is_empty() {
                 continue;
             }
 
-            let seq = {
+            let observed_seq = {
                 let targets = targeted_contracts.targets();
-                sequence_from_observed(&observed, &targets, ObservedCallDepth::DirectOnly, None)
+                sequence_from_observed(
+                    &observed,
+                    &targets,
+                    sender_filters,
+                    ObservedCallDepth::DirectOnly,
+                    None,
+                )
             };
 
             let insertion_mode = if self.id == 0 {
@@ -1234,7 +1301,8 @@ impl WorkerCorpus {
                 CorpusInsertionMode::MemoryOnly
             };
             let len_before = self.in_memory_corpus.len();
-            let _ = self.push_observed_sequence(seq, insertion_mode);
+            self.record_observed_sequence_stats(observed_seq.stats);
+            let _ = self.push_observed_sequence(observed_seq.tx_seq, insertion_mode);
             if self.in_memory_corpus.len() > len_before {
                 debug!(target: "corpus", test = %func.name, "seeded corpus sequence from test trace");
                 added += 1;
@@ -1253,9 +1321,23 @@ impl WorkerCorpus {
             return None;
         }
 
+        let fingerprint = corpus_sequence_fingerprint(&tx_seq);
+        if !self.hoisted_fingerprints.insert(fingerprint) {
+            self.metrics.hoisted_skipped_duplicate += 1;
+            return None;
+        }
+
         let corpus = CorpusEntry::new(tx_seq);
 
-        self.insert_corpus_entry(corpus, insertion_mode, false)
+        let entry = self.insert_corpus_entry(corpus, insertion_mode, false, Some(fingerprint));
+        self.metrics.hoisted_inserted += 1;
+        entry
+    }
+
+    const fn record_observed_sequence_stats(&mut self, stats: ObservedSequenceStats) {
+        self.metrics.hoisted_skipped_sender += stats.skipped_sender;
+        self.metrics.hoisted_skipped_replay += stats.skipped_replay;
+        self.metrics.hoisted_skipped_limits += stats.skipped_limits;
     }
 
     /// Returns the next call to be used in call sequence.
@@ -1747,35 +1829,81 @@ enum ObservedCallDepth {
     All,
 }
 
+#[derive(Default)]
+struct ObservedSequence {
+    tx_seq: Vec<BasicTxDetails>,
+    stats: ObservedSequenceStats,
+}
+
+#[derive(Default)]
+struct ObservedSequenceStats {
+    skipped_sender: usize,
+    skipped_replay: usize,
+    skipped_limits: usize,
+}
+
 fn sequence_from_observed(
     observed: &[ObservedCall],
     targets: &TargetedContracts,
+    sender_filters: &SenderFilters,
     depth: ObservedCallDepth,
     first_delay: Option<(Option<U256>, Option<U256>)>,
-) -> Vec<BasicTxDetails> {
+) -> ObservedSequence {
     let mut first_delay = first_delay;
-    observed
-        .iter()
-        .filter(|call| matches!(depth, ObservedCallDepth::All) || call.depth == 1)
-        .filter_map(|call| {
-            let mut tx = BasicTxDetails {
-                warp: None,
-                roll: None,
-                sender: call.caller,
-                call_details: CallDetails {
-                    target: call.target,
-                    calldata: call.calldata.clone(),
-                    value: call.value,
-                },
-            };
-            targets.can_replay(&tx).then(|| {
-                let (warp, roll) = first_delay.take().unwrap_or((None, None));
-                tx.warp = warp;
-                tx.roll = roll;
-                tx
-            })
-        })
-        .collect()
+    let mut out = ObservedSequence::default();
+    for call in
+        observed.iter().filter(|call| matches!(depth, ObservedCallDepth::All) || call.depth == 1)
+    {
+        if out.tx_seq.len() >= MAX_HOISTED_SEQUENCE_LEN
+            || call.calldata.len() > MAX_HOISTED_CALLDATA_LEN
+        {
+            out.stats.skipped_limits += 1;
+            continue;
+        }
+
+        let mut tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: call.caller,
+            call_details: CallDetails {
+                target: call.target,
+                calldata: call.calldata.clone(),
+                value: call.value,
+            },
+        };
+
+        if !sender_filters.can_replay(tx.sender) {
+            out.stats.skipped_sender += 1;
+            continue;
+        }
+        if !targets.can_replay(&tx) {
+            out.stats.skipped_replay += 1;
+            continue;
+        }
+
+        let (warp, roll) = first_delay.take().unwrap_or((None, None));
+        tx.warp = warp;
+        tx.roll = roll;
+        out.tx_seq.push(tx);
+    }
+    out
+}
+
+fn corpus_sequence_fingerprint(tx_seq: &[BasicTxDetails]) -> B256 {
+    let mut bytes = Vec::new();
+    for tx in tx_seq {
+        bytes.extend_from_slice(tx.sender.as_slice());
+        bytes.extend_from_slice(tx.call_details.target.as_slice());
+        bytes.extend_from_slice(&(tx.call_details.calldata.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(tx.call_details.calldata.as_ref());
+        bytes.extend_from_slice(&tx.call_details.value.unwrap_or_default().to_be_bytes::<32>());
+        bytes.push(u8::from(tx.call_details.value.is_some()));
+        bytes.extend_from_slice(&tx.warp.unwrap_or_default().to_be_bytes::<32>());
+        bytes.push(u8::from(tx.warp.is_some()));
+        bytes.extend_from_slice(&tx.roll.unwrap_or_default().to_be_bytes::<32>());
+        bytes.push(u8::from(tx.roll.is_some()));
+    }
+    keccak256(bytes)
 }
 
 fn prepare_campaign_output_dir(config: &FuzzCorpusConfig) {
@@ -1805,6 +1933,15 @@ fn persist_campaign_entry(config: &FuzzCorpusConfig, entry: CampaignCorpusEntry)
             corpus.uuid,
         );
     }
+}
+
+fn dedupe_hoisted_entries(
+    entries: impl IntoIterator<Item = CampaignCorpusEntry>,
+) -> impl Iterator<Item = CampaignCorpusEntry> {
+    let mut seen = HashSet::new();
+    entries.into_iter().filter(move |entry| {
+        entry.hoisted_fingerprint.is_none_or(|fingerprint| seen.insert(fingerprint))
+    })
 }
 
 fn persist_optimization_output(
@@ -2106,6 +2243,7 @@ mod tests {
                 cumulative_features_seen: 11,
                 corpus_count: 1,
                 favored_items: 0,
+                ..Default::default()
             },
             failed_replays: 13,
             optimization_best_value: Some(I256::try_from(17).unwrap()),
@@ -2147,6 +2285,7 @@ mod tests {
                 cumulative_features_seen: 11,
                 corpus_count: 10,
                 favored_items: 5,
+                ..Default::default()
             },
             failed_replays: 13,
             optimization_best_value: Some(I256::try_from(17).unwrap()),
@@ -2268,10 +2407,13 @@ mod tests {
         };
         let mut manager = empty_worker_corpus(0, temp_corpus_dir());
 
+        let sender_filters = SenderFilters::new(vec![], vec![]);
         let campaign_entry = manager.hoist_observed_calls(
             &observed,
+            0,
             &parent_tx,
             &targeted_contracts,
+            &sender_filters,
             CorpusInsertionMode::Live,
         );
 
@@ -2315,10 +2457,13 @@ mod tests {
         let worker_corpus_dir = corpus_root.join("worker1").join(CORPUS_DIR);
         let mut manager = empty_worker_corpus(1, corpus_root);
 
+        let sender_filters = SenderFilters::new(vec![], vec![]);
         let campaign_entry = manager.hoist_observed_calls(
             &observed,
+            0,
             &basic_tx(),
             &targeted_contracts,
+            &sender_filters,
             CorpusInsertionMode::Deferred,
         );
 
@@ -2355,8 +2500,10 @@ mod tests {
             manager
                 .hoist_observed_calls(
                     &observed,
+                    0,
                     &basic_tx(),
                     &targeted_contracts,
+                    &SenderFilters::new(vec![], vec![]),
                     CorpusInsertionMode::Live
                 )
                 .is_none()
@@ -2368,8 +2515,10 @@ mod tests {
             manager
                 .hoist_observed_calls(
                     &[],
+                    0,
                     &basic_tx(),
                     &targeted_contracts,
+                    &SenderFilters::new(vec![], vec![]),
                     CorpusInsertionMode::Live
                 )
                 .is_none()
@@ -2425,12 +2574,280 @@ mod tests {
             },
         ];
 
-        let seq = sequence_from_observed(&observed, &targets, ObservedCallDepth::DirectOnly, None);
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let observed_seq = sequence_from_observed(
+            &observed,
+            &targets,
+            &sender_filters,
+            ObservedCallDepth::DirectOnly,
+            None,
+        );
+        let seq = observed_seq.tx_seq;
 
         assert_eq!(seq.len(), 1);
         assert_eq!(seq[0].sender, sender);
         assert_eq!(seq[0].call_details.target, target);
         assert_eq!(&seq[0].call_details.calldata[..4], &foo_selector[..]);
+    }
+
+    #[test]
+    fn hoist_observed_calls_respects_sender_filters() {
+        let target = Address::from([0x42; 20]);
+        let allowed_sender = Address::from([0xaa; 20]);
+        let excluded_sender = Address::from([0xbb; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let observed = vec![
+            ObservedCall {
+                depth: 1,
+                caller: excluded_sender,
+                target,
+                calldata: Bytes::from(selector.to_vec()),
+                value: None,
+            },
+            ObservedCall {
+                depth: 1,
+                caller: allowed_sender,
+                target,
+                calldata: Bytes::from(selector.to_vec()),
+                value: None,
+            },
+        ];
+        let sender_filters = SenderFilters::new(vec![allowed_sender], vec![excluded_sender]);
+        let mut manager = empty_worker_corpus(0, temp_corpus_dir());
+
+        let campaign_entry = manager.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+
+        assert!(campaign_entry.is_none());
+        assert_eq!(manager.in_memory_corpus.len(), 1);
+        let entry = manager.in_memory_corpus.last().unwrap();
+        assert_eq!(entry.tx_seq.len(), 1);
+        assert_eq!(entry.tx_seq[0].sender, allowed_sender);
+    }
+
+    #[test]
+    fn hoist_observed_calls_records_limit_and_replay_skips() {
+        let target = Address::from([0x42; 20]);
+        let sender = Address::from([0xaa; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let mut observed = vec![ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+            value: None,
+        }];
+        observed.extend((0..MAX_HOISTED_SEQUENCE_LEN + 1).map(|_| ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(selector.to_vec()),
+            value: None,
+        }));
+        observed.push(ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(vec![0u8; MAX_HOISTED_CALLDATA_LEN + 1]),
+            value: None,
+        });
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let mut manager = empty_worker_corpus(0, temp_corpus_dir());
+
+        let campaign_entry = manager.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+
+        assert!(campaign_entry.is_none());
+        let entry = manager.in_memory_corpus.last().unwrap();
+        assert_eq!(entry.tx_seq.len(), MAX_HOISTED_SEQUENCE_LEN);
+        assert_eq!(manager.metrics.hoisted_inserted, 1);
+        assert_eq!(manager.metrics.hoisted_skipped_limits, 2);
+        assert_eq!(manager.metrics.hoisted_skipped_replay, 1);
+    }
+
+    #[test]
+    fn hoist_observed_calls_counts_dropped_observed_calls_as_limits() {
+        let target = Address::from([0x42; 20]);
+        let sender = Address::from([0xaa; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let observed = vec![ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(selector.to_vec()),
+            value: None,
+        }];
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let mut manager = empty_worker_corpus(0, temp_corpus_dir());
+
+        let campaign_entry = manager.hoist_observed_calls(
+            &observed,
+            7,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+
+        assert!(campaign_entry.is_none());
+        assert_eq!(manager.metrics.hoisted_inserted, 1);
+        assert_eq!(manager.metrics.hoisted_skipped_limits, 7);
+    }
+
+    #[test]
+    fn hoist_observed_calls_dedupes_identical_sequences() {
+        let target = Address::from([0x42; 20]);
+        let sender = Address::from([0xaa; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let observed = vec![ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(selector.to_vec()),
+            value: None,
+        }];
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let mut manager = empty_worker_corpus(0, temp_corpus_dir());
+
+        let first = manager.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+        let second = manager.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+        assert_eq!(manager.in_memory_corpus.len(), 1);
+        assert_eq!(manager.metrics.hoisted_inserted, 1);
+        assert_eq!(manager.metrics.hoisted_skipped_duplicate, 1);
+    }
+
+    #[test]
+    fn hoisted_test_seed_worker_modes_avoid_duplicate_persistence() {
+        let target = Address::from([0x42; 20]);
+        let sender = Address::from([0xaa; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let observed = vec![ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(selector.to_vec()),
+            value: None,
+        }];
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let corpus_root = temp_corpus_dir();
+        let mut master = empty_worker_corpus(0, corpus_root.clone());
+        let mut worker = empty_worker_corpus(1, corpus_root.clone());
+
+        master.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::Live,
+        );
+        worker.hoist_observed_calls(
+            &observed,
+            0,
+            &basic_tx(),
+            &targeted_contracts,
+            &sender_filters,
+            CorpusInsertionMode::MemoryOnly,
+        );
+
+        assert_eq!(master.in_memory_corpus.len(), 1);
+        assert_eq!(worker.in_memory_corpus.len(), 1);
+        assert_eq!(read_corpus_dir(&corpus_root.join("worker0").join(CORPUS_DIR)).count(), 1);
+        assert_eq!(read_corpus_dir(&corpus_root.join("worker1").join(CORPUS_DIR)).count(), 0);
+    }
+
+    #[test]
+    fn deferred_hoisted_entries_are_deduped_before_persistence() {
+        let target = Address::from([0x42; 20]);
+        let sender = Address::from([0xaa; 20]);
+        let foo = Function::parse("foo()").unwrap();
+        let selector = foo.selector();
+        let targeted_contracts =
+            targeted_contracts_with_selective_functions(target, vec![foo], [selector]);
+        let observed = vec![ObservedCall {
+            depth: 1,
+            caller: sender,
+            target,
+            calldata: Bytes::from(selector.to_vec()),
+            value: None,
+        }];
+        let sender_filters = SenderFilters::new(vec![], vec![]);
+        let corpus_root = temp_corpus_dir();
+        let mut worker_a = empty_worker_corpus(1, corpus_root.clone());
+        let mut worker_b = empty_worker_corpus(2, corpus_root.clone());
+
+        let entry_a = worker_a
+            .hoist_observed_calls(
+                &observed,
+                0,
+                &basic_tx(),
+                &targeted_contracts,
+                &sender_filters,
+                CorpusInsertionMode::Deferred,
+            )
+            .unwrap();
+        let entry_b = worker_b
+            .hoist_observed_calls(
+                &observed,
+                0,
+                &basic_tx(),
+                &targeted_contracts,
+                &sender_filters,
+                CorpusInsertionMode::Deferred,
+            )
+            .unwrap();
+
+        WorkerCorpus::persist_campaign_outputs(
+            &corpus_config(corpus_root.clone()),
+            vec![entry_a, entry_b],
+            None,
+        );
+
+        assert_eq!(read_corpus_dir(&corpus_root.join("worker0").join(CORPUS_DIR)).count(), 1);
     }
 
     #[test]

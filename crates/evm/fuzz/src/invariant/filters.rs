@@ -70,4 +70,9 @@ impl SenderFilters {
         targeted.retain(|addr| !excluded.contains(addr));
         Self { targeted, excluded }
     }
+
+    pub fn can_replay(&self, sender: Address) -> bool {
+        !self.excluded.contains(&sender)
+            && (self.targeted.is_empty() || self.targeted.contains(&sender))
+    }
 }
