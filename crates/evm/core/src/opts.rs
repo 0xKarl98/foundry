@@ -88,6 +88,10 @@ pub struct EvmOpts {
     /// Disables storage caching entirely.
     pub no_storage_caching: bool,
 
+    /// Disables parent-block BAL cache prewarming for transaction-hash forks.
+    #[serde(default)]
+    pub no_fork_bal: bool,
+
     /// The initial balance of each deployed test contract.
     pub initial_balance: U256,
 
@@ -311,6 +315,7 @@ impl Default for EvmOpts {
             compute_units_per_second: None,
             no_rpc_rate_limit: false,
             no_storage_caching: false,
+            no_fork_bal: false,
             initial_balance: U256::default(),
             sender: Address::default(),
             ffi: false,

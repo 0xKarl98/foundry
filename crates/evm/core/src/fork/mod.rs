@@ -2,6 +2,7 @@ use super::opts::EvmOpts;
 
 pub mod database;
 
+mod bal;
 mod multi;
 pub use multi::{ForkId, ForkResult, MultiFork, MultiForkHandler};
 
