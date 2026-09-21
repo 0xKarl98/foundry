@@ -300,11 +300,12 @@ async fn fork_bal_prepare_skips_mutable_and_custom_sources_without_requests() {
         ForkContext { source_fork_block_hash: Some(B256::ZERO), ..ordinary },
     ];
     for context in contexts {
+        let resolved = resolved(context);
         let asserter = Asserter::new();
-        asserter.push_success(&Option::<AnyRpcBlock>::None);
+        asserter.push_success(&BlockAccessList::new());
         let provider =
             ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(asserter.clone());
-        assert!(prepare(&provider, &resolved(context)).await.is_none());
+        assert!(prepare(&provider, &resolved, &block(&resolved, 0)).await.is_none());
         assert_eq!(asserter.read_q().len(), 1);
     }
 }
@@ -322,18 +323,17 @@ async fn fork_bal_prepare_checks_parent_identity_and_source_timestamp_before_bal
             _ => unreachable!(),
         }
         let asserter = Asserter::new();
-        asserter.push_success(&block);
         asserter.push_success(&BlockAccessList::new());
         let provider =
             ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(asserter.clone());
 
-        assert!(prepare(&provider, &resolved).await.is_none());
+        assert!(prepare(&provider, &resolved, &block).await.is_none());
         assert_eq!(asserter.read_q().len(), 1);
     }
 }
 
 #[tokio::test]
-async fn fork_bal_prepare_accepts_known_chains_with_execution_chain_override() {
+async fn fork_bal_prepare_reuses_block_with_execution_chain_override() {
     for chain in [NamedChain::Mainnet, NamedChain::Sepolia, NamedChain::Holesky, NamedChain::Hoodi]
     {
         let resolved = resolved(ForkContext {
@@ -342,12 +342,11 @@ async fn fork_bal_prepare_accepts_known_chains_with_execution_chain_override() {
             ..context()
         });
         let asserter = Asserter::new();
-        asserter.push_success(&block(&resolved, 0));
         asserter.push_success(&BlockAccessList::new());
         let provider =
             ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(asserter.clone());
 
-        assert!(prepare(&provider, &resolved).await.is_some());
+        assert!(prepare(&provider, &resolved, &block(&resolved, 0)).await.is_some());
         assert!(asserter.read_q().is_empty());
     }
 }
@@ -359,23 +358,14 @@ async fn fork_bal_prepare_falls_back_without_caching_unavailability() {
     let asserter = Asserter::new();
     let provider =
         ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(asserter.clone());
-    asserter.push_failure_msg("header unavailable");
-    assert!(prepare(&provider, &resolved).await.is_none());
-    asserter.push_success(&Option::<AnyRpcBlock>::None);
-    assert!(prepare(&provider, &resolved).await.is_none());
-
-    asserter.push_success(&block);
     asserter.push_failure_msg("BAL unsupported");
-    assert!(prepare(&provider, &resolved).await.is_none());
-    asserter.push_success(&block);
+    assert!(prepare(&provider, &resolved, &block).await.is_none());
     asserter.push_success(&Option::<BlockAccessList>::None);
-    assert!(prepare(&provider, &resolved).await.is_none());
-    asserter.push_success(&block);
+    assert!(prepare(&provider, &resolved, &block).await.is_none());
     asserter.push_success(&"malformed BAL");
-    assert!(prepare(&provider, &resolved).await.is_none());
+    assert!(prepare(&provider, &resolved, &block).await.is_none());
 
-    asserter.push_success(&block);
     asserter.push_success(&BlockAccessList::new());
-    assert!(prepare(&provider, &resolved).await.is_some());
+    assert!(prepare(&provider, &resolved, &block).await.is_some());
     assert!(asserter.read_q().is_empty());
 }

@@ -789,16 +789,16 @@ async fn create_fork<
     // Here we use [`AnyNetwork`] to maximize compatibility with custom chains, aligned with
     // `EvmOpts::env` impl.
     let any_provider = fork.evm_opts.fork_provider_with_url::<AnyNetwork>(&fork.url)?;
-    let (evm_env, resolved) = if let Some(resolved) = fork.resolved.clone() {
-        let evm_env = fork
+    let (evm_env, resolved, bal_block) = if let Some(resolved) = fork.resolved.clone() {
+        let (evm_env, block) = fork
             .evm_opts
             .fork_evm_env_at_resolved::<_, BLOCK, _, _>(&any_provider, &resolved)
             .await?;
-        (evm_env, resolved)
+        (evm_env, resolved, prewarm_bal.then_some(block))
     } else {
         let (evm_env, resolved) =
             fork.evm_opts.fork_evm_env_resolved::<_, BLOCK, _, _>(&any_provider).await?;
-        (evm_env, resolved)
+        (evm_env, resolved, None)
     };
     let fork_context = resolved.context();
     if require_endpoint_family_match
@@ -833,7 +833,11 @@ async fn create_fork<
     };
 
     let provider = fork.evm_opts.fork_provider_with_url::<N>(&fork.url)?;
-    let seed = if prewarm_bal { bal::prepare(&any_provider, &resolved).await } else { None };
+    let seed = if let Some(block) = bal_block {
+        bal::prepare(&any_provider, &resolved, &block).await
+    } else {
+        None
+    };
     let db = BlockchainDb::new(meta, cache_path);
     let anchor = ForkBlock::with_rpc_number(
         evm_env.block_env.number().saturating_to(),

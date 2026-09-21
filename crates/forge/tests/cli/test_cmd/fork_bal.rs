@@ -333,6 +333,7 @@ forgetest_async!(fork_bal_parent_cache_preserves_every_transaction_position, |pr
     prj.add_test("ForkBal.t.sol", TEST);
     for mode in 0..4 {
         for (index, target) in fixture.transactions.iter().enumerate() {
+            let mut block_reads = Vec::new();
             for disabled in [false, true] {
                 proxy.clear();
                 command(
@@ -348,6 +349,7 @@ forgetest_async!(fork_bal_parent_cache_preserves_every_transaction_position, |pr
                     cmd.arg("--no-fork-bal");
                 }
                 assert_test(&mut cmd, "testForkBal");
+                block_reads.push(proxy.count("eth_getBlockByHash"));
                 if disabled {
                     assert_eq!(proxy.count(BAL_METHOD), 0);
                     assert!(proxy.slot_reads(U256::ZERO) > 0);
@@ -357,6 +359,7 @@ forgetest_async!(fork_bal_parent_cache_preserves_every_transaction_position, |pr
                 }
                 assert!(proxy.slot_reads(U256::from(1)) > 0, "read-only slots need RPC fallback");
             }
+            assert_eq!(block_reads[0], block_reads[1], "BAL fetched an extra block: mode={mode}");
         }
     }
 });
@@ -438,6 +441,12 @@ forgetest_async!(fork_bal_unusable_responses_fall_back_to_replay, |prj, cmd| {
         );
         proxy.assert_parent_bal(&fixture);
         assert!(proxy.slot_reads(U256::ZERO) > 0, "invalid BAL was used: {mode:?}");
+        let block_reads = proxy.count("eth_getBlockByHash");
+        proxy.clear();
+        command(&mut cmd, &fixture, &proxy, fixture.transactions[2], 9, 1, r"^testForkBal\(\)$")
+            .arg("--no-fork-bal");
+        assert_test(&mut cmd, "testForkBal");
+        assert_eq!(proxy.count("eth_getBlockByHash"), block_reads, "extra block read: {mode:?}");
     }
 });
 

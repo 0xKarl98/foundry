@@ -31,26 +31,23 @@ pub(super) struct PreparedBalSeed {
 pub(super) async fn prepare<P: Provider<AnyNetwork>>(
     provider: &P,
     resolved: &ResolvedFork,
+    block: &AnyRpcBlock,
 ) -> Option<PreparedBalSeed> {
-    if !eligible_source(resolved.context()) {
+    if !eligible_source(resolved.context())
+        || block.header.hash != resolved.hash()
+        || block.header.number() != resolved.number()
+        || !EthereumHardfork::from_chain_and_timestamp(
+            Chain::from_id(resolved.context().source_chain_id),
+            block.header.timestamp(),
+        )
+        .is_some_and(|hardfork| hardfork >= EthereumHardfork::Cancun)
+    {
         return None;
     }
 
     let prepare = async {
-        let block = provider.get_block_by_hash(resolved.hash()).await.ok()??;
-        if block.header.hash != resolved.hash()
-            || block.header.number() != resolved.number()
-            || !EthereumHardfork::from_chain_and_timestamp(
-                Chain::from_id(resolved.context().source_chain_id),
-                block.header.timestamp(),
-            )
-            .is_some_and(|hardfork| hardfork >= EthereumHardfork::Cancun)
-        {
-            return None;
-        }
-
         let bal = fetch_block_access_list(provider, BlockId::hash(resolved.hash())).await?;
-        match PreparedBalSeed::new(bal, &block, resolved) {
+        match PreparedBalSeed::new(bal, block, resolved) {
             Ok(seed) => Some(seed),
             Err(err) => {
                 debug!(target: "backend::fork", block_hash = %resolved.hash(), %err, "ignoring invalid fork BAL");
@@ -59,7 +56,7 @@ pub(super) async fn prepare<P: Provider<AnyNetwork>>(
         }
     };
 
-    // Header and BAL reads share the optional budget, including the provider's retries.
+    // Reuse the block fetched for the fork environment; only the optional BAL read needs a budget.
     let seed = tokio::time::timeout(Duration::from_millis(500), prepare).await.ok().flatten();
     if seed.is_none() {
         debug!(target: "backend::fork", block_hash = %resolved.hash(), "fork BAL unavailable or ineligible");
@@ -99,7 +96,9 @@ impl PreparedBalSeed {
         let mut storage = Vec::new();
         for account in bal {
             if !account.storage_changes.is_empty() {
-                storage.push((account.address, account.storage_post_states().collect()));
+                let mut slots = Vec::with_capacity(account.storage_changes.len());
+                slots.extend(account.storage_post_states());
+                storage.push((account.address, slots));
             }
             let balance = account.balance_post_state();
             let nonce = account.nonce_post_state();
