@@ -4,6 +4,7 @@ use crate::{
     ForkChoice, NodeConfig, PrecompileFactory,
     config::{ForkTransactionReplay, PruneStateHistoryConfig, source_hardfork},
     eth::{
+        api::{TempoCertifiedBlock, tempo_consensus_missing},
         backend::{
             cheats::{CheatEcrecover, CheatsManager, NextBlockOverrides},
             db::{
@@ -32,6 +33,7 @@ use crate::{
                 prepare_fork_transaction_replay,
             },
             tempo::AnvilStorageProvider,
+            tempo_consensus::{TempoConsensus, TempoConsensusIdentity},
             time::{PendingBlockTimestamp, TimeManager, TimeSnapshot, utc_from_secs},
             validate::TransactionValidator,
         },
@@ -196,7 +198,7 @@ use tempo_precompiles::{
     tip20_factory::TIP20Factory,
 };
 use tempo_primitives::{
-    AASigned, SignatureType, TEMPO_TX_TYPE_ID, TempoSignature,
+    AASigned, SignatureType, TEMPO_TX_TYPE_ID, TempoHeader, TempoSignature, TempoTxEnvelope,
     transaction::{
         Call, KeychainSignature, PrimitiveSignature, RecoveredTempoAuthorization,
         tt_signature::{P256SignatureWithPreHash, WebAuthnSignature},
@@ -1078,6 +1080,7 @@ struct StateSnapshot {
     fees: FeeSnapshot,
     time: TimeSnapshot,
     next_block: NextBlockOverrides,
+    tempo_consensus: Option<TempoConsensus>,
 }
 
 #[cfg(test)]
@@ -1139,6 +1142,9 @@ pub struct Backend<N: Network> {
     new_block_listeners: Arc<Mutex<Vec<UnboundedSender<ChainNotification>>>>,
     /// Keeps track of active state snapshots at a specific block.
     active_state_snapshots: Arc<Mutex<HashMap<U256, StateSnapshot>>>,
+    /// Local Tempo keys and certificates, committed with the canonical block under the mining
+    /// lock.
+    tempo_consensus: Arc<RwLock<Option<TempoConsensus>>>,
     enable_steps_tracing: bool,
     print_logs: bool,
     print_traces: bool,
@@ -1186,6 +1192,7 @@ impl<N: Network> Clone for Backend<N> {
             genesis: self.genesis.clone(),
             new_block_listeners: self.new_block_listeners.clone(),
             active_state_snapshots: self.active_state_snapshots.clone(),
+            tempo_consensus: self.tempo_consensus.clone(),
             enable_steps_tracing: self.enable_steps_tracing,
             print_logs: self.print_logs,
             print_traces: self.print_traces,
@@ -1986,6 +1993,7 @@ impl<N: Network> Backend<N> {
                 fees: self.fees.snapshot(),
                 time: self.time.snapshot(),
                 next_block: self.cheats.next_block_overrides(),
+                tempo_consensus: self.tempo_consensus.read().clone(),
             },
         );
         id
@@ -2436,11 +2444,13 @@ impl<N: Network> Backend<N> {
                     header.general_gas_limit,
                     header.shared_gas_limit,
                     header.timestamp_millis_part,
+                    header.consensus_context,
                 )
             })
             .or_else(|| {
-                self.is_tempo()
-                    .then(|| (header.timestamp().saturating_mul(1000), header.gas_limit(), 0, 0))
+                self.is_tempo().then(|| {
+                    (header.timestamp().saturating_mul(1000), header.gas_limit(), 0, 0, None)
+                })
             });
 
         let block = AlloyBlock {
@@ -2471,8 +2481,15 @@ impl<N: Network> Backend<N> {
             general_gas_limit,
             shared_gas_limit,
             timestamp_millis_part,
+            consensus_context,
         )) = tempo_fields
         {
+            if let Some(context) = consensus_context {
+                block.other.insert(
+                    "consensusContext".into(),
+                    serde_json::to_value(context).expect("Tempo context serializes"),
+                );
+            }
             block.other.insert(
                 "timestampMillis".to_string(),
                 serde_json::Value::String(format!("0x{timestamp_millis:x}")),
@@ -4632,13 +4649,22 @@ impl<N: Network> Backend<N> {
             states = states.disk_path(cache_path);
         }
 
-        let (slots_in_an_epoch, precompile_factory, disable_pool_balance_checks, hardfork) = {
+        let (
+            slots_in_an_epoch,
+            precompile_factory,
+            disable_pool_balance_checks,
+            hardfork,
+            tempo_consensus,
+        ) = {
             let cfg = node_config.read().await;
             (
                 cfg.slots_in_an_epoch,
                 cfg.precompile_factory.clone(),
                 cfg.disable_pool_balance_checks,
                 cfg.get_hardfork(),
+                networks.is_tempo().then(|| {
+                    TempoConsensus::new(cfg.resolved_tempo_consensus_seed(), cfg.tempo_epoch_length)
+                }),
             )
         };
         let startup_cache_lease = if fork.read().is_some() {
@@ -4672,6 +4698,7 @@ impl<N: Network> Backend<N> {
             fees,
             genesis,
             active_state_snapshots: Arc::new(Mutex::new(Default::default())),
+            tempo_consensus: Arc::new(RwLock::new(tempo_consensus)),
             enable_steps_tracing,
             print_logs,
             print_traces,
@@ -5321,8 +5348,17 @@ impl<N: Network> Backend<N> {
         *self.evm_env.write() = evm_env;
         *self.fork.write() = Some(fork);
         *self.last_fork_cache_source.write() = fork_cache_source;
-        *self.blockchain.storage.write() =
-            BlockchainStorage::forked(fork_block_number, fork_block_hash, fork_total_difficulty);
+        {
+            let mut storage = self.blockchain.storage.write();
+            *storage = BlockchainStorage::forked(
+                fork_block_number,
+                fork_block_hash,
+                fork_total_difficulty,
+            );
+            if let Some(consensus) = self.tempo_consensus.write().as_mut() {
+                consensus.reset();
+            }
+        }
         self.states.write().clear();
         self.active_state_snapshots.lock().clear();
         self.time.reset(timestamp);
@@ -5510,7 +5546,13 @@ impl<N: Network> Backend<N> {
         *self.evm_env.write() = evm_env;
         *self.hardfork.write() = hardfork;
         *self.fork.write() = None;
-        *self.blockchain.storage.write() = storage;
+        {
+            let mut live_storage = self.blockchain.storage.write();
+            *live_storage = storage;
+            if let Some(consensus) = self.tempo_consensus.write().as_mut() {
+                consensus.reset();
+            }
+        }
         self.states.write().clear();
         self.active_state_snapshots.lock().clear();
         self.time.reset(timestamp);
@@ -5524,7 +5566,7 @@ impl<N: Network> Backend<N> {
     where
         N::ReceiptEnvelope: TxReceipt<Log = alloy_primitives::Log>,
     {
-        let Some((num, hash, fees, time, next_block)) =
+        let Some((num, hash, fees, time, next_block, tempo_consensus)) =
             self.active_state_snapshots.lock().get(&id).map(|snapshot| {
                 (
                     snapshot.block_number,
@@ -5532,6 +5574,7 @@ impl<N: Network> Backend<N> {
                     snapshot.fees,
                     snapshot.time,
                     snapshot.next_block,
+                    snapshot.tempo_consensus.clone(),
                 )
             })
         else {
@@ -5548,7 +5591,12 @@ impl<N: Network> Backend<N> {
             snapshots.retain(|snapshot_id, _| *snapshot_id < id);
         }
         // Revert the storage that's newer than the snapshot.
-        let removed_blocks = self.blockchain.storage.write().unwind_to(num, hash);
+        let removed_blocks = {
+            let mut storage = self.blockchain.storage.write();
+            let removed = storage.unwind_to(num, hash);
+            *self.tempo_consensus.write() = tempo_consensus;
+            removed
+        };
         let removed_hashes: Vec<_> = removed_blocks.iter().map(|b| b.header.hash_slow()).collect();
         self.states.write().remove_block_states(&removed_hashes);
         if !removed_logs.is_empty() {
@@ -5575,6 +5623,108 @@ impl<N: Network> Backend<N> {
         }
         self.fees.restore(fees);
         Ok(true)
+    }
+
+    /// Returns a certificate and its native Tempo block from the same canonical chain state.
+    pub fn tempo_finalization(
+        &self,
+        height: Option<u64>,
+    ) -> Result<Option<TempoCertifiedBlock>, BlockchainError> {
+        self.ensure_tempo_active()?;
+        // Mining and unwinds acquire storage before consensus state in this same order.
+        let storage = self.blockchain.storage.read();
+        let consensus = self.tempo_consensus.read();
+        let consensus = consensus.as_ref().expect("Tempo initializes its local committee");
+        let finalization = match height {
+            Some(height) => consensus.finalization(height),
+            None => consensus.latest().map(|(_, certificate)| certificate),
+        };
+        let Some(finalization) = finalization else { return Ok(None) };
+        let block = height
+            .is_none()
+            .then(|| consensus.latest_block())
+            .flatten()
+            .or_else(|| storage.blocks.get(&finalization.digest))
+            .ok_or_else(|| tempo_consensus_missing("block"))?;
+        let header =
+            block.header.as_tempo().expect("local Tempo blocks have Tempo headers").clone();
+        if storage.hashes.get(&header.inner.number) != Some(&finalization.digest)
+            || header.inner.number > storage.best_number
+        {
+            return Err(tempo_consensus_missing("block"));
+        }
+        let transactions = block
+            .body
+            .transactions
+            .iter()
+            .map(|tx| {
+                Ok(match tx.as_ref() {
+                    FoundryTxEnvelope::Legacy(tx) => TempoTxEnvelope::Legacy(tx.clone()),
+                    FoundryTxEnvelope::Eip2930(tx) => TempoTxEnvelope::Eip2930(tx.clone()),
+                    FoundryTxEnvelope::Eip1559(tx) => TempoTxEnvelope::Eip1559(tx.clone()),
+                    FoundryTxEnvelope::Eip7702(tx) => TempoTxEnvelope::Eip7702(tx.clone()),
+                    FoundryTxEnvelope::Tempo(tx) => TempoTxEnvelope::AA(tx.clone()),
+                    _ => {
+                        return Err(BlockchainError::Internal(
+                            "non-Tempo transaction in certified block".into(),
+                        ));
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, BlockchainError>>()?;
+        let body = tempo_primitives::BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals: header.inner.withdrawals_root.map(|_| Default::default()),
+        };
+        // Pruning or a state import may leave the signed header without its complete body.
+        tempo_evm::consensus::validate_body_against_header(&body, &header)
+            .map_err(|_| tempo_consensus_missing("block"))?;
+        Ok(Some(TempoCertifiedBlock {
+            epoch: finalization.epoch,
+            view: finalization.view,
+            digest: finalization.digest,
+            certificate: hex::encode(&finalization.certificate),
+            block: tempo_primitives::Block::new(header, body),
+        }))
+    }
+
+    /// Returns the public key of the committee currently signing local blocks.
+    pub fn tempo_consensus_identity(&self) -> Result<TempoConsensusIdentity, BlockchainError> {
+        self.ensure_tempo_active()?;
+        Ok(self
+            .tempo_consensus
+            .read()
+            .as_ref()
+            .expect("Tempo initializes its local committee")
+            .identity())
+    }
+
+    /// Schedules a rotation without racing block production, snapshots, or chain rewinds.
+    pub async fn rotate_tempo_consensus_identity(
+        &self,
+    ) -> Result<TempoConsensusIdentity, BlockchainError> {
+        self.ensure_tempo_active()?;
+        let _mining = self.mining.lock().await;
+        let head = self.best_number();
+        self.tempo_consensus
+            .write()
+            .as_mut()
+            .expect("Tempo initializes its local committee")
+            .rotate(head)
+            .map_err(|err| RpcError::invalid_params(err.to_string()).into())
+    }
+
+    /// Prepares only consensus-owned header fields, before executing or committing a block.
+    fn tempo_consensus_header(&self, number: u64) -> Result<Option<TempoHeader>, BlockchainError> {
+        let consensus = self.tempo_consensus.read();
+        let Some(consensus) = consensus.as_ref() else { return Ok(None) };
+        let mut header =
+            TempoHeader { inner: Header { number, ..Default::default() }, ..Default::default() };
+        consensus
+            .prepare_header(&mut header, self.tempo_hardfork())
+            .map_err(|err| BlockchainError::Internal(err.to_string()))?;
+        Ok(Some(header))
     }
 }
 
@@ -5833,7 +5983,9 @@ where
         }
 
         let best_number = self.blockchain.storage.read().best_number;
-        let block_number = best_number.saturating_add(1);
+        let block_number = best_number
+            .checked_add(1)
+            .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
         evm_env.block_env.number = evm_env.block_env.number.saturating_add(U256::ONE);
         evm_env.block_env.basefee = current_base_fee;
         evm_env.block_env.blob_excess_gas_and_price = current_excess_blob_gas_and_price;
@@ -5896,6 +6048,7 @@ where
         #[cfg(not(feature = "monad"))]
         let monad_context = None;
 
+        let consensus_header = self.tempo_consensus_header(block_number)?;
         let (block_info, state_changes, block_hash) = {
             let db = self.db.read().await;
             let mut overlay = AnvilCacheDB::new(&**db, *replay_env.spec_id());
@@ -5926,6 +6079,7 @@ where
                 transaction_infos,
                 parent_beacon_block_root,
                 None,
+                consensus_header,
             );
             let block_hash = block_info.block.header.hash_slow();
             (block_info, state_changes, block_hash)
@@ -5953,6 +6107,9 @@ where
             if !self.is_eip3675() {
                 storage.total_difficulty =
                     storage.total_difficulty.saturating_add(header.difficulty);
+            }
+            if let Some(consensus) = self.tempo_consensus.write().as_mut() {
+                consensus.finalize(&block, block_hash, self.tempo_hardfork());
             }
             storage.blocks.insert(block_hash, block);
             storage.hashes.insert(block_number, block_hash);
@@ -6144,6 +6301,7 @@ where
         transaction_infos: Vec<TransactionInfo>,
         parent_beacon_block_root: Option<B256>,
         block_access_list: Option<&BlockAccessList>,
+        consensus_header: Option<TempoHeader>,
     ) -> BlockInfo<N> {
         let spec_id = *evm_env.spec_id();
         let is_shanghai = spec_id >= SpecId::SHANGHAI;
@@ -6185,7 +6343,18 @@ where
             slot_number: None,
         };
 
-        let block = create_block(foundry_header(&self.networks, header), transactions);
+        let header = if let Some(mut tempo) = consensus_header {
+            let extra_data = tempo.inner.extra_data;
+            tempo.general_gas_limit = header.gas_limit;
+            tempo.inner = header;
+            if !extra_data.is_empty() {
+                tempo.inner.extra_data = extra_data;
+            }
+            tempo.into()
+        } else {
+            foundry_header(&self.networks, header)
+        };
+        let block = create_block(header, transactions);
         BlockInfo { block, transactions: transaction_infos, receipts: block_result.receipts }
     }
 
@@ -6220,7 +6389,14 @@ where
                 evm_env.cfg_env.disable_base_fee = true;
             }
 
-            let block_number = self.blockchain.storage.read().best_number.saturating_add(1);
+            let block_number = self
+                .blockchain
+                .storage
+                .read()
+                .best_number
+                .checked_add(1)
+                .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
+            let consensus_header = self.tempo_consensus_header(block_number)?;
 
             // Advance the EVM number independently of the RPC header number. On Arbitrum
             // forks this preserves the L1 number read by NUMBER while the header tracks L2.
@@ -6356,6 +6532,7 @@ where
                     pool_result.tx_info,
                     parent_beacon_block_root,
                     block_access_list.as_ref(),
+                    consensus_header,
                 );
 
                 // Update the new blockhash in the db itself.
@@ -6439,6 +6616,9 @@ where
                     storage.total_difficulty.saturating_add(header.difficulty);
             }
 
+            if let Some(consensus) = self.tempo_consensus.write().as_mut() {
+                consensus.finalize(&block, block_hash, self.tempo_hardfork());
+            }
             storage.blocks.insert(block_hash, block);
             storage.hashes.insert(block_number, block_hash);
             if let Some(block_access_list) = block_access_list {
@@ -6573,7 +6753,11 @@ where
         let mut cache_db = AnvilCacheDB::new(&*db, *evm_env.spec_id());
 
         let parent_hash = self.blockchain.storage.read().best_hash;
-        let block_number = self.best_number().saturating_add(1);
+        let block_number = self
+            .best_number()
+            .checked_add(1)
+            .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
+        let consensus_header = self.tempo_consensus_header(block_number)?;
 
         #[cfg(feature = "base")]
         let (pool_transactions, system_transaction_count) = {
@@ -6631,6 +6815,7 @@ where
             pool_result.tx_info,
             parent_beacon_block_root,
             None,
+            consensus_header,
         );
 
         Ok(f(Box::new(cache_db), block_info))
@@ -7690,8 +7875,15 @@ where
             let removed_logs = self.removed_logs_since(common_block.header.number());
 
             // Unwind the storage back to the common ancestor first
-            let removed_blocks =
-                self.blockchain.storage.write().unwind_to(common_block.header.number(), hash);
+            let removed_blocks = {
+                let mut storage = self.blockchain.storage.write();
+                let changed_head = storage.best_number > common_block.header.number();
+                let removed = storage.unwind_to(common_block.header.number(), hash);
+                if changed_head && let Some(consensus) = self.tempo_consensus.write().as_mut() {
+                    consensus.unwind(common_block.header.number());
+                }
+                removed
+            };
 
             // Clean up in-memory and on-disk states for removed blocks
             let removed_hashes: Vec<_> =
@@ -8602,7 +8794,18 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
                 .collect()
         };
 
-        *self.blockchain.storage.write() = storage;
+        {
+            let mut live_storage = self.blockchain.storage.write();
+            // State dumps do not include private committees or certificates. A different canonical
+            // history starts a fresh local committee, just as a fork/reset does.
+            if (live_storage.best_number != storage.best_number
+                || live_storage.hashes != storage.hashes)
+                && let Some(consensus) = self.tempo_consensus.write().as_mut()
+            {
+                consensus.reset();
+            }
+            *live_storage = storage;
+        }
         if let Some(timestamp) = canonical_timestamp {
             self.time.reset(timestamp);
         }

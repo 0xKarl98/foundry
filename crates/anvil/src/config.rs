@@ -8,6 +8,7 @@ use crate::{
             },
             genesis::GenesisConfig,
             mem::fork_db::ForkedDatabase,
+            tempo_consensus::TempoConsensus,
             time::duration_since_unix_epoch,
         },
         fees::{INITIAL_BASE_FEE, INITIAL_GAS_PRICE},
@@ -64,6 +65,7 @@ use serde_json::{Value, json};
 use std::{
     fmt::Write as FmtWrite,
     net::{IpAddr, Ipv4Addr},
+    num::NonZeroU64,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -91,6 +93,8 @@ pub const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
 pub const DEFAULT_SLOTS_IN_AN_EPOCH: u64 = 32;
 /// Default mnemonic for dev accounts
 pub const DEFAULT_MNEMONIC: &str = "test test test test test test test test test test test junk";
+/// Default number of blocks in a local Tempo consensus epoch.
+pub const DEFAULT_TEMPO_EPOCH_LENGTH: NonZeroU64 = NonZeroU64::new(21_600).unwrap();
 
 /// Resolves source-chain upgrades without changing another execution family's historical lookup.
 pub(crate) fn source_hardfork(
@@ -358,6 +362,10 @@ pub struct NodeConfig {
     ///
     /// Must be an unlocked signer account. Defaults to the last dev account on Tempo networks.
     pub tempo_fee_payer: Option<Address>,
+    /// Number of blocks in a local Tempo consensus epoch.
+    pub tempo_epoch_length: NonZeroU64,
+    /// Explicit seed for deterministic local Tempo consensus identities.
+    pub tempo_consensus_seed: Option<B256>,
     /// Do not print log messages.
     pub silent: bool,
     /// The path where persisted states are cached (used with `max_persisted_states`).
@@ -425,6 +433,17 @@ Tempo Fee Payer
 ==================
 {fee_payer}
 "#
+            );
+        }
+
+        if self.networks.is_tempo() {
+            let consensus =
+                TempoConsensus::new(self.resolved_tempo_consensus_seed(), self.tempo_epoch_length);
+            let identity = consensus.identity();
+            let _ = write!(
+                s,
+                "\nTempo Consensus\n==================\nIdentity:          {}\nEpoch length:      {}\n",
+                identity.identity, identity.epoch_length
             );
         }
 
@@ -714,6 +733,8 @@ impl Default for NodeConfig {
             #[cfg(feature = "base")]
             base_activation_admin: None,
             tempo_fee_payer: None,
+            tempo_epoch_length: DEFAULT_TEMPO_EPOCH_LENGTH,
+            tempo_consensus_seed: None,
             silent: false,
             cache_path: None,
             funded_accounts: HashMap::default(),
@@ -1388,6 +1409,31 @@ impl NodeConfig {
             return None;
         }
         self.tempo_fee_payer.or_else(|| self.genesis_accounts.last().map(|wallet| wallet.address()))
+    }
+
+    /// Sets the number of blocks in a local Tempo consensus epoch.
+    #[must_use]
+    pub const fn with_tempo_epoch_length(mut self, epoch_length: NonZeroU64) -> Self {
+        self.tempo_epoch_length = epoch_length;
+        self
+    }
+
+    /// Sets an explicit seed for deterministic local Tempo consensus identities.
+    #[must_use]
+    pub const fn with_tempo_consensus_seed(mut self, seed: Option<B256>) -> Self {
+        self.tempo_consensus_seed = seed;
+        self
+    }
+
+    /// Resolves the local consensus seed, deriving it from the configured mnemonic by default.
+    pub fn resolved_tempo_consensus_seed(&self) -> B256 {
+        self.tempo_consensus_seed.unwrap_or_else(|| {
+            let mnemonic = self
+                .account_generator
+                .as_ref()
+                .map_or(DEFAULT_MNEMONIC, AccountGenerator::get_phrase);
+            TempoConsensus::default_seed(mnemonic)
+        })
     }
 
     /// Enable Monad network features.
@@ -3027,5 +3073,31 @@ mod tests {
 
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn tempo_consensus_seed_uses_mnemonic_or_explicit_seed() {
+        let default_config = NodeConfig::test_tempo();
+        assert_eq!(
+            default_config.resolved_tempo_consensus_seed(),
+            keccak256(format!("anvil/tempo-consensus/{DEFAULT_MNEMONIC}"))
+        );
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let config = NodeConfig::test_tempo()
+            .with_account_generator(AccountGenerator::new(1).phrase(mnemonic))
+            .unwrap();
+        assert_eq!(
+            config.resolved_tempo_consensus_seed(),
+            keccak256(format!("anvil/tempo-consensus/{mnemonic}"))
+        );
+        assert_ne!(
+            config.resolved_tempo_consensus_seed(),
+            default_config.resolved_tempo_consensus_seed()
+        );
+        let seed = B256::repeat_byte(0x42);
+        assert_eq!(
+            config.with_tempo_consensus_seed(Some(seed)).resolved_tempo_consensus_seed(),
+            seed
+        );
     }
 }

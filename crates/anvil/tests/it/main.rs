@@ -36,6 +36,7 @@ mod state;
 mod storage_values;
 mod tempo;
 mod tempo_canary;
+mod tempo_consensus;
 mod traces;
 mod transaction;
 mod txpool;

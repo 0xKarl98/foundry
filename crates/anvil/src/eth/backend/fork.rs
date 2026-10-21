@@ -1,8 +1,12 @@
 //! Support for forking off another client
 
-use crate::eth::{backend::db::Db, error::BlockchainError};
+use crate::eth::{
+    api::{TempoCertifiedBlock, tempo_consensus_missing},
+    backend::db::Db,
+    error::BlockchainError,
+};
 use alloy_chains::NamedChain;
-use alloy_consensus::{BlockHeader, TrieAccount};
+use alloy_consensus::{BlockHeader, Sealable, TrieAccount};
 use alloy_eips::eip2930::AccessListResult;
 use alloy_network::{
     AnyNetwork, AnyRpcBlock, BlockResponse, Network, TransactionResponse,
@@ -35,6 +39,7 @@ use alloy_rpc_types_eth::{AccountInfo, Bundle, EthCallResponse, StateContext};
 use alloy_rpc_types_mev::{EthCallBundle, EthCallBundleResponse};
 use alloy_serde::WithOtherFields;
 use alloy_transport::TransportError;
+use anvil_core::eth::TempoFinalizationQuery;
 use foundry_common::provider::{RetryProvider, is_rpc_method_not_found};
 use foundry_evm::{
     backend::{AccountFetchPolicy, BlockchainDb, account_fetch_policy_for_source},
@@ -784,6 +789,31 @@ impl<N: Network> ClientFork<N> {
             .collect::<Option<Vec<_>>>()?;
         *block.transactions_mut() = BlockTransactions::Full(transactions);
         Some(block)
+    }
+
+    /// Queries Tempo's upstream finalization archive, preserving its JSON-RPC errors.
+    pub async fn consensus_get_finalization(
+        &self,
+        query: TempoFinalizationQuery,
+    ) -> Result<TempoCertifiedBlock, BlockchainError> {
+        let (provider, number, hash) = {
+            let config = self.config.read();
+            (config.provider.clone(), config.block_number, config.block_hash)
+        };
+        let finalization = provider
+            .raw_request::<_, TempoCertifiedBlock>("consensus_getFinalization".into(), (query,))
+            .await?;
+        // A mutable upstream may replace this height after the local fork pinned its state.
+        if query == TempoFinalizationQuery::Height(number)
+            && (finalization.block.header.inner.number != number
+                || finalization.digest != hash
+                || finalization.block.header.hash_slow() != finalization.digest)
+        {
+            return Err(tempo_consensus_missing(
+                "upstream finalization does not match the pinned fork root",
+            ));
+        }
+        Ok(finalization)
     }
 }
 

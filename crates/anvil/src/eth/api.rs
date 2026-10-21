@@ -10,7 +10,8 @@ use crate::{
     eth::{
         backend::{
             self, db::SerializableState, mem::MIN_TRANSACTION_GAS,
-            notifications::ChainNotifications, validate::TransactionValidator,
+            notifications::ChainNotifications, tempo_consensus::TempoConsensusIdentity,
+            validate::TransactionValidator,
         },
         error::{
             BlockchainError, FeeHistoryError, InvalidTransactionError, Result, ToRpcResponseResult,
@@ -33,7 +34,7 @@ use crate::{
     mem::transaction_build,
 };
 use alloy_consensus::{
-    Blob, BlockHeader, Transaction, TrieAccount, TxEip4844Variant, TxReceipt, Typed2718,
+    Blob, BlockHeader, Sealable, Transaction, TrieAccount, TxEip4844Variant, TxReceipt, Typed2718,
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_dyn_abi::TypedData;
@@ -81,7 +82,7 @@ use alloy_serde::WithOtherFields;
 use alloy_sol_types::{SolCall, SolValue, sol};
 use anvil_core::{
     eth::{
-        EthRequest,
+        EthRequest, TempoFinalizationQuery,
         block::{Block, BlockInfo, canonical_block},
         transaction::{MaybeImpersonatedTransaction, PendingTransaction},
     },
@@ -117,7 +118,9 @@ use revm::{
 };
 use std::{sync::Arc, time::Duration};
 use tempo_hardfork::TempoHardfork;
-use tempo_primitives::{AASigned, TEMPO_TX_TYPE_ID, transaction::FEE_PAYER_SIGNATURE_MARKER};
+use tempo_primitives::{
+    AASigned, TEMPO_TX_TYPE_ID, TempoHeader, transaction::FEE_PAYER_SIGNATURE_MARKER,
+};
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, unbounded_channel},
     try_join,
@@ -1820,11 +1823,29 @@ impl EthApi<FoundryNetwork> {
         Ok(())
     }
 
-    /// Returns a locally stored rollback ancestor, or the remote base of a Monad transaction-hash
-    /// fork when that integration is enabled.
+    /// Returns a locally stored rollback ancestor or a supported execution family's fork root.
     async fn rollback_block(&self, number: u64) -> Result<Option<Block>> {
         if let Some(block) = self.backend.get_block(number) {
             return Ok(Some(block));
+        }
+        if self.backend.is_tempo()
+            && let Some(fork) = self.get_fork()
+            && number == fork.block_number()
+        {
+            let Some(block) = fork.block_by_hash(fork.block_hash()).await? else { return Ok(None) };
+            // The complete RPC object retains Tempo's flattened header extension fields.
+            let header = serde_json::to_value(block)
+                .and_then(serde_json::from_value::<TempoHeader>)
+                .map_err(|err| {
+                    BlockchainError::Internal(format!("invalid Tempo fork header: {err}"))
+                })?;
+            if header.inner.number != number || header.hash_slow() != fork.block_hash() {
+                return Err(BlockchainError::Internal(
+                    "Tempo fork header does not match the configured fork root".into(),
+                ));
+            }
+            // Rollback uses the retained state and header; keep its committed body roots intact.
+            return Ok(Some(Block::new(header.into(), Default::default())));
         }
         #[cfg(feature = "monad")]
         {
@@ -2632,6 +2653,16 @@ impl EthApi<FoundryNetwork> {
                 .anvil_set_fee_amm_liquidity(user_token, validator_token, amount)
                 .await
                 .to_rpc_result(),
+            EthRequest::ConsensusGetFinalization(query) => {
+                self.consensus_get_finalization(query).await.to_rpc_result()
+            }
+            EthRequest::ConsensusGetLatest(()) => self.consensus_get_latest().await.to_rpc_result(),
+            EthRequest::TempoConsensusIdentity(()) => {
+                self.anvil_tempo_consensus_identity().to_rpc_result()
+            }
+            EthRequest::TempoRotateConsensusIdentity(()) => {
+                self.anvil_tempo_rotate_consensus_identity().await.to_rpc_result()
+            }
         }
     }
 
@@ -5554,6 +5585,80 @@ impl EthApi<FoundryNetwork> {
         }
         self.request_nonce(request.as_ref(), from).await
     }
+
+    /// Returns a local finalization or forwards a historical query to the fixed fork source.
+    pub async fn consensus_get_finalization(
+        &self,
+        query: TempoFinalizationQuery,
+    ) -> Result<TempoCertifiedBlock> {
+        node_info!("consensus_getFinalization");
+        self.ensure_tempo_mode()?;
+        let height = match query {
+            TempoFinalizationQuery::Latest => None,
+            TempoFinalizationQuery::Height(height) => Some(height),
+        };
+        if let Some(height) = height
+            && let Some(fork) = self.get_fork()
+            && fork.predates_fork_inclusive(height)
+        {
+            return fork.consensus_get_finalization(query).await;
+        }
+        if let Some(finalization) = self.backend.tempo_finalization(height)? {
+            return Ok(finalization);
+        }
+        if height.is_none()
+            && let Some(fork) = self.get_fork()
+        {
+            // Upstream `latest` may have advanced beyond the fixed fork's execution state.
+            return fork
+                .consensus_get_finalization(TempoFinalizationQuery::Height(fork.block_number()))
+                .await;
+        }
+        // The local archive is ready at startup, even before the first certificate exists.
+        Err(tempo_consensus_missing(if height.is_some() {
+            "certificate"
+        } else {
+            "certifications"
+        }))
+    }
+
+    /// Returns the latest finalized block, with no notarization for this single-node committee.
+    pub async fn consensus_get_latest(&self) -> Result<TempoConsensusState> {
+        node_info!("consensus_getLatest");
+        self.ensure_tempo_mode()?;
+        let mut finalized = self.backend.tempo_finalization(None)?;
+        if finalized.is_none()
+            && let Some(fork) = self.get_fork()
+        {
+            finalized = match fork
+                .consensus_get_finalization(TempoFinalizationQuery::Height(fork.block_number()))
+                .await
+            {
+                Ok(block) => Some(block),
+                Err(BlockchainError::AlloyForkProvider(err))
+                    if err.as_error_resp().is_some_and(|err| matches!(err.code, 204 | 503)) =>
+                {
+                    None
+                }
+                Err(err) => return Err(err),
+            };
+        }
+        Ok(TempoConsensusState { finalized, notarized: None })
+    }
+
+    /// Returns the current local committee's public identity.
+    pub fn anvil_tempo_consensus_identity(&self) -> Result<TempoConsensusIdentity> {
+        node_info!("anvil_tempoConsensusIdentity");
+        self.ensure_tempo_mode()?;
+        self.backend.tempo_consensus_identity()
+    }
+
+    /// Schedules an identity for the epoch after the next block's epoch.
+    pub async fn anvil_tempo_rotate_consensus_identity(&self) -> Result<TempoConsensusIdentity> {
+        node_info!("anvil_tempoRotateConsensusIdentity");
+        self.ensure_tempo_mode()?;
+        self.backend.rotate_tempo_consensus_identity().await
+    }
 }
 
 fn is_simple_transfer_request(request: &TransactionRequest) -> bool {
@@ -5801,10 +5906,52 @@ fn reward_at_percentile(rewards: &[u128], percentile: f64) -> u128 {
     rewards.get(index).copied().unwrap_or_default()
 }
 
+/// A Tempo block with a complete threshold BLS finalization certificate.
+///
+/// This matches Tempo's consensus RPC without introducing the consensus node as a dependency.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoCertifiedBlock {
+    /// Epoch containing the finalized proposal.
+    pub epoch: u64,
+    /// View containing the finalized proposal.
+    pub view: u64,
+    /// Hash of the complete Tempo header.
+    pub digest: B256,
+    /// Full native certificate as unprefixed hex, matching Tempo's `hex::encode` representation.
+    pub certificate: String,
+    /// Native Tempo header and body, without a sealed-header wrapper.
+    pub block: tempo_primitives::Block,
+}
+
+/// The current Tempo consensus state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoConsensusState {
+    /// The latest finalization, if any.
+    pub finalized: Option<TempoCertifiedBlock>,
+    /// Always absent, matching Tempo's finalized-only feed.
+    pub notarized: Option<TempoCertifiedBlock>,
+}
+
+/// Matches Tempo's `Response::Missing` JSON-RPC mapping.
+pub(crate) fn tempo_consensus_missing(content: &'static str) -> BlockchainError {
+    RpcError {
+        code: ErrorCode::ServerError(503),
+        message: "the consensus subservice was not available, but the request can be retried later"
+            .into(),
+        data: Some(content.into()),
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{NodeConfig, spawn};
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use std::num::NonZeroU64;
 
     #[cfg(feature = "base")]
     #[tokio::test(flavor = "multi_thread")]
@@ -5957,5 +6104,144 @@ mod tests {
         assert_eq!(response.blob_gas_used_ratio.len(), 6);
         assert_eq!(response.base_fee_per_blob_gas.len(), 6);
         assert_eq!(rewards.len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tempo_consensus_fork_preserves_upstream_errors() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (_origin_api, origin_handle) = spawn(NodeConfig::test_tempo()).await;
+            let origin_url = origin_handle.http_endpoint();
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+            let upstream_error = Arc::new(RwLock::new(Value::Null));
+            let response_error = upstream_error.clone();
+            let router = Router::new().route(
+                "/",
+                post(move |Json(request): Json<Value>| {
+                    let client = client.clone();
+                    let origin_url = origin_url.clone();
+                    let response_error = response_error.clone();
+                    async move {
+                        if request["method"] == "consensus_getFinalization" {
+                            assert_eq!(request["params"], json!([{ "height": 0 }]));
+                            return Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": response_error.read().clone(),
+                            }));
+                        }
+                        Json(
+                            client
+                                .post(origin_url)
+                                .json(&request)
+                                .send()
+                                .await
+                                .unwrap()
+                                .json::<Value>()
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let proxy = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let (api, _handle) =
+                spawn(NodeConfig::test_tempo().with_eth_rpc_url(Some(endpoint))).await;
+
+            for error in [
+                json!({ "code": 204, "message": "the requested content was not available" }),
+                json!({
+                    "code": 503,
+                    "message": "the consensus subservice was not available, but the request can be retried later",
+                    "data": "certificate",
+                }),
+                json!({ "code": -32099, "message": "upstream failed", "data": { "reason": 1 } }),
+            ] {
+                *upstream_error.write() = error.clone();
+                for query in [TempoFinalizationQuery::Height(0), TempoFinalizationQuery::Latest] {
+                    let result = api.consensus_get_finalization(query).await.to_rpc_result();
+                    assert_eq!(serde_json::to_value(result).unwrap(), json!({ "error": error }));
+                }
+                let latest = api.consensus_get_latest().await.to_rpc_result();
+                let expected = if error["code"] == -32099 {
+                    json!({ "error": error })
+                } else {
+                    json!({ "result": { "finalized": null, "notarized": null } })
+                };
+                assert_eq!(serde_json::to_value(latest).unwrap(), expected);
+            }
+            proxy.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tempo_consensus_zero_depth_rollback_preserves_scheduled_identity() {
+        let (api, _handle) = spawn(
+            NodeConfig::test_tempo()
+                .with_no_mining(true)
+                .with_tempo_epoch_length(NonZeroU64::new(3).unwrap()),
+        )
+        .await;
+        api.anvil_mine(Some(U256::from(2)), None).await.unwrap();
+        api.anvil_rollback(Some(1)).await.unwrap();
+
+        let scheduled = api.anvil_tempo_rotate_consensus_identity().await.unwrap();
+        assert_eq!(scheduled.from_epoch, 1);
+        api.anvil_rollback(Some(0)).await.unwrap();
+        api.anvil_mine(Some(U256::from(2)), None).await.unwrap();
+
+        assert_eq!(api.anvil_tempo_consensus_identity().unwrap(), scheduled);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tempo_consensus_fork_rejects_replaced_upstream_root() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (origin, origin_handle) = spawn(NodeConfig::test_tempo().with_no_mining(true)).await;
+            origin.anvil_mine(Some(U256::from(2)), None).await.unwrap();
+            let original = origin
+                .consensus_get_finalization(TempoFinalizationQuery::Height(2))
+                .await
+                .unwrap();
+            let (fork, _handle) = spawn(
+                NodeConfig::test_tempo()
+                    .with_no_mining(true)
+                    .with_eth_rpc_url(Some(origin_handle.http_endpoint()))
+                    .with_fork_block_number(Some(2u64)),
+            )
+            .await;
+            assert_eq!(
+                fork.consensus_get_finalization(TempoFinalizationQuery::Latest).await.unwrap(),
+                original
+            );
+
+            origin.anvil_rollback(Some(1)).await.unwrap();
+            origin.evm_set_next_block_timestamp(original.block.header.inner.timestamp + 1).unwrap();
+            origin.anvil_mine(Some(U256::from(1)), None).await.unwrap();
+            let replacement = origin
+                .consensus_get_finalization(TempoFinalizationQuery::Height(2))
+                .await
+                .unwrap();
+            assert_ne!(replacement.digest, original.digest);
+            assert_eq!(fork.get_fork().unwrap().block_hash(), original.digest);
+
+            let expected = json!({
+                "error": {
+                    "code": 503,
+                    "message": "the consensus subservice was not available, but the request can be retried later",
+                    "data": "upstream finalization does not match the pinned fork root",
+                },
+            });
+            for query in [TempoFinalizationQuery::Height(2), TempoFinalizationQuery::Latest] {
+                let result = fork.consensus_get_finalization(query).await.to_rpc_result();
+                assert_eq!(serde_json::to_value(result).unwrap(), expected);
+            }
+            let latest = fork.consensus_get_latest().await.to_rpc_result();
+            assert_eq!(serde_json::to_value(latest).unwrap(), expected);
+        })
+        .await
+        .unwrap();
     }
 }

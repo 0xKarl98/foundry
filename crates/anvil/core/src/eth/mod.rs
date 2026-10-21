@@ -942,6 +942,32 @@ pub enum EthRequest {
         #[serde(deserialize_with = "deserialize_number")]
         U256,
     ),
+
+    /// Returns a Tempo finalization certificate and its block.
+    #[serde(rename = "consensus_getFinalization", with = "sequence")]
+    ConsensusGetFinalization(TempoFinalizationQuery),
+
+    /// Returns the latest Tempo consensus state.
+    #[serde(rename = "consensus_getLatest", with = "empty_params")]
+    ConsensusGetLatest(()),
+
+    /// Returns the current local Tempo consensus identity.
+    #[serde(rename = "anvil_tempoConsensusIdentity", with = "empty_params")]
+    TempoConsensusIdentity(()),
+
+    /// Schedules a new local Tempo consensus identity.
+    #[serde(rename = "anvil_tempoRotateConsensusIdentity", with = "empty_params")]
+    TempoRotateConsensusIdentity(()),
+}
+
+/// Tempo's consensus query format, matching `tempo_node::rpc::consensus::Query`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TempoFinalizationQuery {
+    /// The latest finalized block.
+    Latest,
+    /// A block at a specific height.
+    Height(u64),
 }
 
 /// Represents ethereum JSON-RPC API
@@ -2358,5 +2384,45 @@ true}]}"#;
         "#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_tempo_consensus_requests() {
+        for request in [
+            r#"{"method":"consensus_getFinalization","params":["latest"]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":0}]}"#,
+            r#"{"method":"consensus_getFinalization","params":[{"height":18446744073709551615}]}"#,
+            r#"{"method":"consensus_getLatest","params":[]}"#,
+            r#"{"method":"anvil_tempoConsensusIdentity","params":[]}"#,
+            r#"{"method":"anvil_tempoRotateConsensusIdentity","params":[]}"#,
+        ] {
+            serde_json::from_str::<EthRequest>(request).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_tempo_consensus_query_case_and_height() {
+        assert_eq!(
+            serde_json::from_str::<TempoFinalizationQuery>(r#""latest""#).unwrap(),
+            TempoFinalizationQuery::Latest
+        );
+        assert_eq!(
+            serde_json::from_str::<TempoFinalizationQuery>(r#"{"height":42}"#).unwrap(),
+            TempoFinalizationQuery::Height(42)
+        );
+        assert_eq!(
+            serde_json::from_str::<TempoFinalizationQuery>(r#""Latest""#).unwrap_err().to_string(),
+            "unknown variant `Latest`, expected `latest` or `height` at line 1 column 8"
+        );
+        assert_eq!(
+            serde_json::from_str::<TempoFinalizationQuery>(r#"{"height":"0x2a"}"#)
+                .unwrap_err()
+                .to_string(),
+            "invalid type: string \"0x2a\", expected u64 at line 1 column 16"
+        );
+        assert_eq!(
+            serde_json::to_value(TempoFinalizationQuery::Height(42)).unwrap(),
+            serde_json::json!({"height":42})
+        );
     }
 }

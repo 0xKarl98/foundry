@@ -1,6 +1,6 @@
 use crate::{
     AccountGenerator, CHAIN_ID, NodeConfig,
-    config::{DEFAULT_MNEMONIC, DEFAULT_SLOTS_IN_AN_EPOCH, ForkChoice},
+    config::{DEFAULT_MNEMONIC, DEFAULT_SLOTS_IN_AN_EPOCH, DEFAULT_TEMPO_EPOCH_LENGTH, ForkChoice},
     eth::{
         EthApi, backend::db::SerializableState, miner::INSTANT_COALESCE_WINDOW,
         pool::transactions::TransactionOrder,
@@ -22,6 +22,7 @@ use futures::FutureExt;
 use rand_08::{SeedableRng, rngs::StdRng};
 use std::{
     net::IpAddr,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
@@ -89,6 +90,16 @@ pub struct NodeArgs {
     /// account.
     #[arg(long = "tempo.fee-payer", value_name = "ADDRESS")]
     pub tempo_fee_payer: Option<Address>,
+
+    /// Number of blocks in a local Tempo consensus epoch.
+    #[arg(long = "tempo.epoch-length", value_name = "BLOCKS", default_value_t = DEFAULT_TEMPO_EPOCH_LENGTH)]
+    pub tempo_epoch_length: NonZeroU64,
+
+    /// Seed for deterministic local Tempo consensus identities.
+    ///
+    /// Defaults to keccak256("anvil/tempo-consensus/" || mnemonic).
+    #[arg(long = "tempo.consensus-seed", value_name = "B256")]
+    pub tempo_consensus_seed: Option<B256>,
 
     /// The EVM hardfork to use.
     ///
@@ -361,6 +372,8 @@ impl NodeArgs {
             // execution chain ID. Fork source discovery can refine an unresolved network later.
             .with_networks(networks)
             .with_tempo_fee_payer(self.tempo_fee_payer)
+            .with_tempo_epoch_length(self.tempo_epoch_length)
+            .with_tempo_consensus_seed(self.tempo_consensus_seed)
             .with_disable_default_create2_deployer(self.evm.disable_default_create2_deployer)
             .with_disable_pool_balance_checks(self.evm.disable_pool_balance_checks)
             .with_slots_in_an_epoch(self.slots_in_an_epoch)
@@ -1669,5 +1682,33 @@ mod tests {
         assert!(
             NodeArgs::try_parse_from(["anvil", "--transaction-coalescing-window", "-1"]).is_err()
         );
+    }
+
+    #[test]
+    fn tempo_consensus_cli() {
+        let config = NodeArgs::parse_from(["anvil"]).into_node_config().unwrap();
+        assert_eq!(config.tempo_epoch_length.get(), 21_600);
+        assert_eq!(config.tempo_consensus_seed, None);
+
+        for epoch_length in ["1", "3", "18446744073709551615"] {
+            let config = NodeArgs::parse_from([
+                "anvil",
+                "--network",
+                "tempo",
+                "--tempo.epoch-length",
+                epoch_length,
+                "--tempo.consensus-seed",
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            ])
+            .into_node_config()
+            .unwrap();
+            assert_eq!(config.tempo_epoch_length.get(), epoch_length.parse::<u64>().unwrap());
+            assert_eq!(config.tempo_consensus_seed, Some(B256::repeat_byte(0x11)));
+        }
+
+        for invalid in ["0", "-1", "18446744073709551616"] {
+            assert!(NodeArgs::try_parse_from(["anvil", "--tempo.epoch-length", invalid]).is_err());
+        }
+        assert!(NodeArgs::try_parse_from(["anvil", "--tempo.consensus-seed", "0x1234"]).is_err());
     }
 }
