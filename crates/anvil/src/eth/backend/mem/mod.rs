@@ -5833,7 +5833,9 @@ where
         }
 
         let best_number = self.blockchain.storage.read().best_number;
-        let block_number = best_number.saturating_add(1);
+        let block_number = best_number
+            .checked_add(1)
+            .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
         evm_env.block_env.number = evm_env.block_env.number.saturating_add(U256::ONE);
         evm_env.block_env.basefee = current_base_fee;
         evm_env.block_env.blob_excess_gas_and_price = current_excess_blob_gas_and_price;
@@ -6220,7 +6222,13 @@ where
                 evm_env.cfg_env.disable_base_fee = true;
             }
 
-            let block_number = self.blockchain.storage.read().best_number.saturating_add(1);
+            let block_number = self
+                .blockchain
+                .storage
+                .read()
+                .best_number
+                .checked_add(1)
+                .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
 
             // Advance the EVM number independently of the RPC header number. On Arbitrum
             // forks this preserves the L1 number read by NUMBER while the header tracks L2.
@@ -6573,7 +6581,10 @@ where
         let mut cache_db = AnvilCacheDB::new(&*db, *evm_env.spec_id());
 
         let parent_hash = self.blockchain.storage.read().best_hash;
-        let block_number = self.best_number().saturating_add(1);
+        let block_number = self
+            .best_number()
+            .checked_add(1)
+            .ok_or_else(|| BlockchainError::Internal("block height overflow".into()))?;
 
         #[cfg(feature = "base")]
         let (pool_transactions, system_transaction_count) = {
@@ -10791,38 +10802,18 @@ fn foundry_header(networks: &NetworkConfigs, header: Header) -> FoundryHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BlockRequest, FeeDetails, ForkCacheNamespace, ForkCacheSource, InstructionResult,
-        MiningCommitHook, Output, StagedForkCacheLease, StagedForkDbUser,
-        arbitrum_replay_block_number,
-    };
-    use crate::{NodeConfig, config::ForkTransactionReplay, spawn};
-    use alloy_network::{AnyHeader, AnyRpcBlock, AnyRpcHeader, TransactionBuilder};
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use super::*;
+    use crate::spawn;
+    use alloy_network::TransactionBuilder;
     use alloy_provider::Provider;
-    use alloy_rpc_types::{Block, BlockTransactions, TransactionRequest, state::EvmOverrides};
-    use alloy_serde::WithOtherFields;
-    use foundry_config::NamedChain;
-    use foundry_evm::{
-        backend::{BlockchainDb, BlockchainDbMeta},
-        hardfork::{EthereumHardfork, FoundryHardfork},
-    };
-    use foundry_evm_networks::arbitrum;
-    use std::sync::Arc;
+    use alloy_rpc_types::Block;
+    use foundry_evm::backend::BlockchainDbMeta;
     use tempfile::tempdir;
-    use tokio::sync::Notify;
 
     #[cfg(feature = "base")]
     use base_common_precompiles::{ActivationRegistryStorage, B20FactoryStorage};
     #[cfg(feature = "base")]
-    use foundry_evm::{hardforks::BaseUpgrade, traces::CallTraceDecoderBuilder};
-
-    #[cfg(all(feature = "base", feature = "optimism"))]
-    use alloy_consensus::Header;
-    #[cfg(all(feature = "base", feature = "optimism"))]
-    use foundry_evm::hardfork::OpHardfork;
-    #[cfg(all(feature = "base", feature = "optimism"))]
-    use foundry_evm_networks::NetworkConfigs;
+    use foundry_evm::traces::CallTraceDecoderBuilder;
 
     fn test_cache_db(cache_path: std::path::PathBuf) -> BlockchainDb {
         let db = BlockchainDb::new(BlockchainDbMeta::default(), Some(cache_path));
@@ -11612,6 +11603,126 @@ mod tests {
         assert_eq!(
             decoder.labels.get(&ActivationRegistryStorage::ADDRESS).map(String::as_str),
             Some("ActivationRegistry")
+        );
+    }
+
+    #[tokio::test]
+    async fn mine_rejects_block_height_overflow() {
+        let (api, _handle) = spawn(
+            NodeConfig::test().with_no_mining(true).with_genesis_block_number(Some(u64::MAX - 1)),
+        )
+        .await;
+        let outcome = api.backend.mine_block(Vec::new()).await.unwrap();
+        assert_eq!(outcome.block_number, u64::MAX);
+        assert_eq!(api.backend.best_number(), u64::MAX);
+        let best_hash = api.backend.best_hash();
+        let hashes = api.backend.blockchain.storage.read().hashes.clone();
+        let state =
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap();
+
+        let err = api.backend.mine_block(Vec::new()).await.unwrap_err();
+
+        assert!(
+            matches!(err, BlockchainError::Internal(message) if message == "block height overflow")
+        );
+        assert_eq!(api.backend.best_number(), u64::MAX);
+        assert_eq!(api.backend.best_hash(), best_hash);
+        assert_eq!(api.backend.blockchain.storage.read().hashes, hashes);
+        assert_eq!(
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap(),
+            state
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_block_rejects_block_height_overflow() {
+        let (api, _handle) = spawn(
+            NodeConfig::test().with_no_mining(true).with_genesis_block_number(Some(u64::MAX - 1)),
+        )
+        .await;
+        let pending = api.backend.pending_block(Vec::new()).await.unwrap();
+        assert_eq!(pending.block.header.number, u64::MAX);
+        assert_eq!(api.backend.best_number(), u64::MAX - 1);
+        api.backend.mine_block(Vec::new()).await.unwrap();
+        let best_hash = api.backend.best_hash();
+        let hashes = api.backend.blockchain.storage.read().hashes.clone();
+        let state =
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap();
+
+        let err = api.backend.pending_block(Vec::new()).await.unwrap_err();
+
+        assert!(
+            matches!(err, BlockchainError::Internal(message) if message == "block height overflow")
+        );
+        assert_eq!(api.backend.best_number(), u64::MAX);
+        assert_eq!(api.backend.best_hash(), best_hash);
+        assert_eq!(api.backend.blockchain.storage.read().hashes, hashes);
+        assert_eq!(
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap(),
+            state
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_replay_rejects_block_height_overflow() {
+        let (_source_api, source_handle) = spawn(NodeConfig::test()).await;
+        let source_provider = source_handle.http_provider();
+        let sender = source_provider.get_accounts().await.unwrap()[0];
+        let recipient = Address::repeat_byte(0x11);
+        let receipt = source_provider
+            .send_transaction(WithOtherFields::new(
+                TransactionRequest::default()
+                    .with_from(sender)
+                    .with_to(recipient)
+                    .with_value(U256::ONE),
+            ))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let source_block = source_provider
+            .get_block_by_hash(receipt.block_hash.unwrap())
+            .full()
+            .await
+            .unwrap()
+            .unwrap();
+        let replay = ForkTransactionReplay { source_block, target_index: 0 };
+        let config = |number| {
+            NodeConfig::test().with_no_mining(true).with_genesis_block_number(Some(number))
+        };
+        let (api, _handle) = spawn(config(u64::MAX)).await;
+        let best_hash = api.backend.best_hash();
+        let hashes = api.backend.blockchain.storage.read().hashes.clone();
+        let state =
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap();
+
+        let err = api.backend.apply_fork_transaction_replay(replay.clone()).await.unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<BlockchainError>(),
+            Some(BlockchainError::Internal(message)) if message == "block height overflow"
+        ));
+        assert_eq!(api.backend.best_number(), u64::MAX);
+        assert_eq!(api.backend.best_hash(), best_hash);
+        assert_eq!(api.backend.blockchain.storage.read().hashes, hashes);
+        assert_eq!(
+            serde_json::to_value(api.backend.serialized_state(true).await.unwrap()).unwrap(),
+            state
+        );
+
+        let (successor_api, _successor_handle) = spawn(config(u64::MAX - 1)).await;
+        successor_api.backend.apply_fork_transaction_replay(replay).await.unwrap();
+        assert_eq!(successor_api.backend.best_number(), u64::MAX);
+        assert_eq!(successor_api.backend.get_balance(recipient, None).await.unwrap(), U256::ONE);
+        assert_eq!(
+            successor_api
+                .backend
+                .mined_transaction_receipt(receipt.transaction_hash)
+                .unwrap()
+                .inner
+                .block_number(),
+            Some(u64::MAX)
         );
     }
 }
